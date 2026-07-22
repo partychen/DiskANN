@@ -18,6 +18,9 @@ pub struct QueryStatistics {
     /// Time spent in query preprocessing for the PQ in microseconds.
     pub query_pq_preprocess_time_us: u128,
 
+    /// Time spent selecting query-aware graph entry points in microseconds.
+    pub routing_time_us: u128,
+
     /// Total number of IO operations issued.
     pub total_io_operations: u32,
 
