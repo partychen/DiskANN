@@ -27,6 +27,7 @@ bincode.workspace = true
 opentelemetry.workspace = true
 diskann-quantization = { workspace = true }
 diskann = { workspace = true }
+diskann-disk.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing.workspace = true
 bit-set.workspace = true

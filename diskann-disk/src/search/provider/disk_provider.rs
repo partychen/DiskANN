@@ -48,6 +48,7 @@ use tracing::debug;
 
 use crate::{
     data_model::{CachingStrategy, GraphHeader},
+    routing::RoutingTable,
     search::{
         provider::{
             aligned_file_reader::AlignedFileReaderFactory,
@@ -248,6 +249,9 @@ where
 
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: &'a Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
+
+    routing_table: Option<&'a RoutingTable<Data::VectorDataType>>,
+    routing_entry_count: NonZeroUsize,
 }
 
 // Struct to track IO. This is used by single thread, but needs to be Atomic as the Strategy has "Send" trait bound.
@@ -255,6 +259,7 @@ where
 struct IOTracker {
     io_time_us: AtomicU64,
     preprocess_time_us: AtomicU64,
+    routing_time_us: AtomicU64,
     io_count: AtomicUsize,
 }
 
@@ -263,6 +268,7 @@ impl Default for IOTracker {
         Self {
             io_time_us: AtomicU64::new(0),
             preprocess_time_us: AtomicU64::new(0),
+            routing_time_us: AtomicU64::new(0),
             io_count: AtomicUsize::new(0),
         }
     }
@@ -527,6 +533,8 @@ where
             query,
             self.vertex_provider_factory,
             self.scratch_pool,
+            self.routing_table,
+            self.routing_entry_count,
         )
     }
 }
@@ -621,6 +629,7 @@ where
     io_tracker: &'a IOTracker,
     scratch: PoolOption<DiskSearchScratch<Data, VP>>,
     query: &'a [Data::VectorDataType],
+    start_points: Vec<u32>,
 }
 
 impl<Data, VP> DiskAccessor<'_, Data, VP>
@@ -667,16 +676,15 @@ where
     VP: VertexProvider<Data>,
 {
     async fn starting_points(&self) -> ANNResult<Vec<u32>> {
-        let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        Ok(vec![start_vertex_id])
+        Ok(self.start_points.clone())
     }
 
     async fn start_point_distances<F>(&mut self, mut f: F) -> ANNResult<()>
     where
         F: FnMut(Self::Id, f32) + Send,
     {
-        let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        self.pq_distances(&[start_vertex_id], |dist, id| f(id, dist))
+        let start_points = self.start_points.clone();
+        self.pq_distances(&start_points, |dist, id| f(id, dist))
     }
 
     fn expand_beam<Itr, P, F>(
@@ -732,6 +740,8 @@ where
         query: &'a [Data::VectorDataType],
         vertex_provider_factory: &'a VPF,
         scratch_pool: &'a Arc<ObjectPool<DiskSearchScratch<Data, VP>>>,
+        routing_table: Option<&RoutingTable<Data::VectorDataType>>,
+        routing_entry_count: NonZeroUsize,
     ) -> ANNResult<Self>
     where
         VPF: VertexProviderFactory<Data, VertexProviderType = VP>,
@@ -751,14 +761,22 @@ where
         // Decode caller's native vector representation into `f32`; downstream PQ kernels operate purely on `&[f32]`.
         let f32_query = Data::VectorDataType::as_f32(query).into_ann_result()?;
         scratch.pq_scratch.set(&f32_query)?;
-        let start_vertex_id = provider.graph_header.metadata().medoid as u32;
+        let routing_timer = Instant::now();
+        let start_points = match routing_table {
+            Some(table) => table.select(query, provider.metric, routing_entry_count)?,
+            None => vec![provider.graph_header.metadata().medoid as u32],
+        };
+        IOTracker::add_time(
+            &io_tracker.routing_time_us,
+            routing_timer.elapsed().as_micros() as u64,
+        );
 
         let timer = Instant::now();
         quantizer_preprocess(
             &mut scratch.pq_scratch,
             &provider.pq_data,
             provider.metric,
-            &[start_vertex_id],
+            &start_points,
         )?;
         IOTracker::add_time(
             &io_tracker.preprocess_time_us,
@@ -770,6 +788,7 @@ where
             io_tracker,
             scratch,
             query,
+            start_points,
         })
     }
 
@@ -817,6 +836,9 @@ pub struct DiskIndexSearcher<
 
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
+
+    routing_table: Option<Arc<RoutingTable<Data::VectorDataType>>>,
+    routing_entry_count: NonZeroUsize,
 }
 
 #[derive(Debug)]
@@ -917,7 +939,74 @@ where
             runtime,
             vertex_provider_factory,
             scratch_pool,
+            routing_table: None,
+            routing_entry_count: NonZeroUsize::MIN,
         })
+    }
+
+    /// Load and enable query-aware graph entry routing.
+    pub fn load_routing_table<P>(
+        &mut self,
+        path: &str,
+        storage_provider: &P,
+        entry_count: NonZeroUsize,
+    ) -> ANNResult<()>
+    where
+        P: StorageReadProvider,
+    {
+        let table = RoutingTable::load(path, storage_provider)?;
+        self.set_routing_table(table, entry_count)
+    }
+
+    /// Enable query-aware graph entry routing with an in-memory table.
+    pub fn set_routing_table(
+        &mut self,
+        table: RoutingTable<Data::VectorDataType>,
+        entry_count: NonZeroUsize,
+    ) -> ANNResult<()> {
+        if entry_count.get() > table.len() {
+            return Err(ANNError::log_index_config_error(
+                "routing_entry_count".into(),
+                format!(
+                    "requested {} entries from a routing table containing {}",
+                    entry_count,
+                    table.len()
+                ),
+            ));
+        }
+        let graph_dimension = self.index.provider().graph_header.metadata().dims as usize;
+        if table.dimension() != graph_dimension {
+            return Err(ANNError::log_index_config_error(
+                "routing_dimension".into(),
+                format!(
+                    "routing dimension {} does not match graph dimension {}",
+                    table.dimension(),
+                    graph_dimension
+                ),
+            ));
+        }
+        if let Some(id) = table
+            .ids()
+            .iter()
+            .find(|&&id| id as usize >= self.index.provider().num_points)
+        {
+            return Err(ANNError::log_index_config_error(
+                "routing_node_id".into(),
+                format!(
+                    "routing node ID {} is outside graph range 0..{}",
+                    id,
+                    self.index.provider().num_points
+                ),
+            ));
+        }
+        self.routing_table = Some(Arc::new(table));
+        self.routing_entry_count = entry_count;
+        Ok(())
+    }
+
+    /// Disable query-aware routing and return to the graph medoid.
+    pub fn clear_routing_table(&mut self) {
+        self.routing_table = None;
     }
 
     /// Helper method to create a `DiskSearchStrategy` with common parameters.
@@ -931,6 +1020,8 @@ where
             postprocess_filter,
             vertex_provider_factory: &self.vertex_provider_factory,
             scratch_pool: &self.scratch_pool,
+            routing_table: self.routing_table.as_deref(),
+            routing_entry_count: self.routing_entry_count,
         }
     }
 
@@ -1199,6 +1290,7 @@ where
         query_stats.total_vertices_loaded = io_tracker.io_count() as u32;
         query_stats.query_pq_preprocess_time_us =
             IOTracker::time(&io_tracker.preprocess_time_us) as u128;
+        query_stats.routing_time_us = IOTracker::time(&io_tracker.routing_time_us) as u128;
         query_stats.cpu_time_us = query_stats.total_execution_time_us
             - query_stats.io_time_us
             - query_stats.query_pq_preprocess_time_us;
@@ -1757,6 +1849,42 @@ mod disk_provider_tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), ANNErrorKind::IndexError);
+    }
+
+    #[test]
+    fn test_disk_search_uses_query_routing_entry() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let mut search_engine = create_disk_index_searcher::<GraphDataF32VectorUnitData>(
+            CreateDiskIndexSearcherParams {
+                pq_pivot_file_path: TEST_PQ_PIVOT,
+                pq_compressed_file_path: TEST_PQ_COMPRESSED,
+                index_path: TEST_INDEX,
+                index_path_prefix: TEST_INDEX_PREFIX,
+                ..Default::default()
+            },
+            &storage_provider,
+        );
+        search_engine
+            .set_routing_table(
+                RoutingTable::new(vec![42], vec![0.0f32; 128], 128).unwrap(),
+                NonZeroUsize::MIN,
+            )
+            .unwrap();
+
+        let query = [0.0f32; 128];
+        let io_tracker = IOTracker::default();
+        let strategy = search_engine.search_strategy(&io_tracker, PostprocessStrategy::AcceptAll);
+        let accessor = strategy
+            .search_accessor(search_engine.index.provider(), &DefaultContext, &query)
+            .unwrap();
+
+        assert_eq!(
+            search_engine
+                .runtime
+                .block_on(glue::SearchAccessor::starting_points(&accessor))
+                .unwrap(),
+            vec![42]
+        );
     }
 
     #[test]

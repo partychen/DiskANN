@@ -37,6 +37,38 @@ This crate has been populated with the core disk index functionality from the ma
 - **Provider**: Disk vertex providers, caching implementations, and factory patterns
 - **Traits**: Core traits for vertex providers and provider factories
 
+#### Query-aware graph entry routing
+
+An optional sidecar can select graph entry points from an in-memory set of real vectors. The disk
+graph is unchanged, so the same index can be benchmarked with either its medoid or routed entries.
+
+Generate a table with k-means++ initialization and Lloyd iterations:
+
+```bash
+cargo run --release -p diskann-tools --bin generate_routing_table -- \
+  --data-type float \
+  --data-file /path/to/base.bin \
+  --output-file /path/to/index.routing \
+  --num-centers 256 \
+  --sampling-rate 0.1 \
+  --random-seed 42
+```
+
+The base file must be the dataset used to build the graph, in the same row order. Enable routing
+after constructing a `DiskIndexSearcher`:
+
+```rust
+searcher.load_routing_table(
+    "/path/to/index.routing",
+    &storage_provider,
+    NonZeroUsize::new(2).unwrap(),
+)?;
+```
+
+`clear_routing_table()` restores medoid-based search. Compare `routing_time_us`,
+`total_io_operations`, `search_hops`, recall, and end-to-end latency while sweeping the number of
+centers and selected entries.
+
 ### Data Model Module
 
 - Graph headers, metadata, layout versioning, and caching structures
