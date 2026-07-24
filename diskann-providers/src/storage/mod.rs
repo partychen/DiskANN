@@ -35,7 +35,7 @@ pub mod path_utility;
 pub use path_utility::{
     get_compressed_pq_file, get_disk_index_compressed_pq_file, get_disk_index_file,
     get_disk_index_pq_pivot_file, get_label_file, get_label_medoids_file, get_mem_index_data_file,
-    get_mem_index_file, get_pq_pivot_file, get_universal_label_file,
+    get_mem_index_file, get_pq_pivot_file, get_start_points_file, get_universal_label_file,
 };
 
 pub mod index_storage;

@@ -36,6 +36,7 @@ use diskann_providers::{
     },
     storage::{get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, LoadWith},
 };
+use diskann_startpoints::StartPointTable;
 use diskann_utils::{
     object_pool::{ObjectPool, PoolOption, TryAsPooled},
     views::Matrix,
@@ -248,6 +249,10 @@ where
 
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: &'a Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
+
+    /// Optional IVF-lite start-point table. When present, search seeds from query-sensitive
+    /// entry vertices instead of the static medoid.
+    entry_table: Option<&'a StartPointTable>,
 }
 
 // Struct to track IO. This is used by single thread, but needs to be Atomic as the Strategy has "Send" trait bound.
@@ -527,6 +532,7 @@ where
             query,
             self.vertex_provider_factory,
             self.scratch_pool,
+            self.entry_table,
         )
     }
 }
@@ -621,6 +627,9 @@ where
     io_tracker: &'a IOTracker,
     scratch: PoolOption<DiskSearchScratch<Data, VP>>,
     query: &'a [Data::VectorDataType],
+    /// Graph entry points for this query: IVF-lite entry vertices when a start-point table
+    /// is installed, otherwise the single static medoid.
+    start_ids: Vec<u32>,
 }
 
 impl<Data, VP> DiskAccessor<'_, Data, VP>
@@ -667,16 +676,15 @@ where
     VP: VertexProvider<Data>,
 {
     async fn starting_points(&self) -> ANNResult<Vec<u32>> {
-        let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        Ok(vec![start_vertex_id])
+        Ok(self.start_ids.clone())
     }
 
     async fn start_point_distances<F>(&mut self, mut f: F) -> ANNResult<()>
     where
         F: FnMut(Self::Id, f32) + Send,
     {
-        let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        self.pq_distances(&[start_vertex_id], |dist, id| f(id, dist))
+        let start_ids = self.start_ids.clone();
+        self.pq_distances(&start_ids, |dist, id| f(id, dist))
     }
 
     fn expand_beam<Itr, P, F>(
@@ -732,6 +740,7 @@ where
         query: &'a [Data::VectorDataType],
         vertex_provider_factory: &'a VPF,
         scratch_pool: &'a Arc<ObjectPool<DiskSearchScratch<Data, VP>>>,
+        entry_table: Option<&StartPointTable>,
     ) -> ANNResult<Self>
     where
         VPF: VertexProviderFactory<Data, VertexProviderType = VP>,
@@ -751,14 +760,29 @@ where
         // Decode caller's native vector representation into `f32`; downstream PQ kernels operate purely on `&[f32]`.
         let f32_query = Data::VectorDataType::as_f32(query).into_ann_result()?;
         scratch.pq_scratch.set(&f32_query)?;
-        let start_vertex_id = provider.graph_header.metadata().medoid as u32;
+
+        // Choose the graph entry points. With an IVF-lite start-point table present (and
+        // dimensionally compatible), seed beam search from the `m` entry vertices nearest to
+        // the query; otherwise fall back to the static medoid (original DiskANN behavior).
+        let medoid = provider.graph_header.metadata().medoid as u32;
+        let start_ids: Vec<u32> = match entry_table {
+            Some(table) if table.dim() == f32_query.len() => {
+                let entries = table.entry_points(&f32_query);
+                if entries.is_empty() {
+                    vec![medoid]
+                } else {
+                    entries
+                }
+            }
+            _ => vec![medoid],
+        };
 
         let timer = Instant::now();
         quantizer_preprocess(
             &mut scratch.pq_scratch,
             &provider.pq_data,
             provider.metric,
-            &[start_vertex_id],
+            &start_ids,
         )?;
         IOTracker::add_time(
             &io_tracker.preprocess_time_us,
@@ -770,6 +794,7 @@ where
             io_tracker,
             scratch,
             query,
+            start_ids,
         })
     }
 
@@ -817,6 +842,10 @@ pub struct DiskIndexSearcher<
 
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
+
+    /// Optional IVF-lite start-point table loaded with the index. It can be overridden via
+    /// [`DiskIndexSearcher::set_entry_table`]; `None` reproduces stock medoid-seeded search.
+    entry_table: Option<StartPointTable>,
 }
 
 #[derive(Debug)]
@@ -879,6 +908,27 @@ where
 
         let graph_header = vertex_provider_factory.get_header()?;
         let metadata = graph_header.metadata();
+        let entry_table = disk_index_reader.get_start_point_table().cloned();
+        if let Some(table) = &entry_table {
+            if table.dim() != metadata.dims {
+                return Err(ANNError::log_index_error(format_args!(
+                    "start-point dimension {} does not match index dimension {}",
+                    table.dim(),
+                    metadata.dims
+                )));
+            }
+            let expected_metric = match metric {
+                Metric::CosineNormalized => Metric::Cosine,
+                metric => metric,
+            };
+            if table.metric() != expected_metric {
+                return Err(ANNError::log_index_error(format_args!(
+                    "start-point metric {} does not match index routing metric {}",
+                    table.metric(),
+                    expected_metric
+                )));
+            }
+        }
         let max_degree = graph_header.max_degree::<Data::VectorDataType>()? as u32;
 
         let config = graph::config::Builder::new(
@@ -917,6 +967,7 @@ where
             runtime,
             vertex_provider_factory,
             scratch_pool,
+            entry_table,
         })
     }
 
@@ -931,7 +982,22 @@ where
             postprocess_filter,
             vertex_provider_factory: &self.vertex_provider_factory,
             scratch_pool: &self.scratch_pool,
+            entry_table: self.entry_table.as_ref(),
         }
+    }
+
+    /// Install (or clear) the IVF-lite start-point table used to seed graph search.
+    ///
+    /// When `Some`, each query seeds beam search from the `m` entry vertices nearest to it
+    /// (see [`diskann_startpoints::StartPointTable`]); when `None`, search falls back to the
+    /// static medoid, reproducing stock DiskANN behavior.
+    pub fn set_entry_table(&mut self, entry_table: Option<StartPointTable>) {
+        self.entry_table = entry_table;
+    }
+
+    /// Return the currently installed start-point table, if any.
+    pub fn entry_table(&self) -> Option<&StartPointTable> {
+        self.entry_table.as_ref()
     }
 
     /// Perform a brute-force linear scan of all points in the index, returning the
@@ -1284,6 +1350,79 @@ mod disk_provider_tests {
         "/disk_index_search/disk_index_sift_learn_R4_L50_A1.2_truth_search_pq_pivots.bin";
     const TEST_PQ_COMPRESSED: &str =
         "/disk_index_search/disk_index_sift_learn_R4_L50_A1.2_truth_search_pq_compressed.bin";
+
+    /// Wire the IVF-lite start-point table into the disk search path and verify that
+    /// query-sensitive entry vertices do not increase routing hops versus the static medoid.
+    #[test]
+    fn test_entry_table_does_not_increase_hops_128dim() {
+        use diskann_startpoints::{StartPointTable, StartPointsConfig};
+        use std::num::NonZeroUsize;
+
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+
+        let mut search_engine = create_disk_index_searcher::<GraphDataF32VectorUnitData>(
+            CreateDiskIndexSearcherParams {
+                max_thread_num: 1,
+                pq_pivot_file_path: TEST_PQ_PIVOT_128DIM,
+                pq_compressed_file_path: TEST_PQ_COMPRESSED_128DIM,
+                index_path: TEST_INDEX_128DIM,
+                index_path_prefix: TEST_INDEX_PREFIX_128DIM,
+                ..Default::default()
+            },
+            &storage_provider,
+        );
+
+        // Offline: build the IVF-lite table over the full-precision base vectors
+        // (row i == graph vertex i).
+        let data =
+            read_bin::<f32>(&mut storage_provider.open_reader(TEST_DATA_FILE).unwrap()).unwrap();
+        let nz = |v| NonZeroUsize::new(v).unwrap();
+        let config = StartPointsConfig::new(nz(16), nz(4), nz(25), 0, Metric::L2);
+        let table = StartPointTable::build(data.as_view(), &config)
+            .unwrap()
+            .expect("start-point table is enabled");
+        assert!(table.num_centroids() >= 1);
+
+        let queries = read_bin::<f32>(
+            &mut storage_provider
+                .open_reader(TEST_QUERY_10PTS_128DIM)
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Baseline: static medoid entry.
+        let mut medoid_hops = 0u32;
+        for query in queries.row_iter() {
+            let result = search_engine
+                .search(query, 10, 20, None, SearchMode::graph())
+                .unwrap();
+            medoid_hops += result.stats.query_statistics.search_hops;
+        }
+
+        // IVF-lite: seed from the m entry vertices nearest to each query.
+        search_engine.set_entry_table(Some(table));
+        let mut entry_hops = 0u32;
+        for query in queries.row_iter() {
+            let result = search_engine
+                .search(query, 10, 20, None, SearchMode::graph())
+                .unwrap();
+            entry_hops += result.stats.query_statistics.search_hops;
+        }
+
+        println!(
+            "hop validation (k=16, m=4, {} queries): medoid={} entries={}",
+            queries.nrows(),
+            medoid_hops,
+            entry_hops
+        );
+
+        assert!(
+            entry_hops <= medoid_hops,
+            "query-sensitive entry vertices increased routing hops: {} > {}",
+            entry_hops,
+            medoid_hops
+        );
+    }
 
     #[test]
     fn test_disk_search_k10_l20_single_or_multi_thread_100dim() {

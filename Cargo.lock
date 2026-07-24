@@ -578,6 +578,7 @@ dependencies = [
  "diskann-linalg",
  "diskann-providers",
  "diskann-quantization",
+ "diskann-startpoints",
  "diskann-utils",
  "diskann-vector",
  "futures-util",
@@ -718,6 +719,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "diskann-startpoints"
+version = "0.55.0"
+dependencies = [
+ "diskann-quantization",
+ "diskann-utils",
+ "diskann-vector",
+ "rand",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ pub mod build;
 pub use build::{
     disk_index_build_parameter, filter_parameter, DiskIndexBuildParameters, QuantizationType,
 };
+pub use diskann_startpoints::{StartPointTable, StartPointsConfig};
 
 pub mod data_model;
 pub mod search;

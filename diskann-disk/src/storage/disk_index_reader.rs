@@ -2,11 +2,12 @@
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT license.
  */
-use std::sync::Arc;
+use std::{io::Read, sync::Arc};
 
-use diskann::ANNResult;
-use diskann_providers::storage::StorageReadProvider;
+use diskann::{ANNError, ANNResult};
+use diskann_providers::storage::{get_start_points_file, StorageReadProvider};
 use diskann_providers::{storage::PQStorage, utils::load_metadata_from_file};
+use diskann_startpoints::StartPointTable;
 
 use crate::search::pq::PQData;
 use tracing::info;
@@ -19,6 +20,8 @@ pub struct DiskIndexReader {
     pq_data: Arc<PQData>,
 
     num_points: usize,
+
+    start_point_table: Option<StartPointTable>,
 }
 
 impl DiskIndexReader {
@@ -28,6 +31,9 @@ impl DiskIndexReader {
         pq_compressed_data_path: String,
         storage_provider: &Storage,
     ) -> ANNResult<Self> {
+        let start_point_path = pq_pivot_path
+            .strip_suffix("_pq_pivots.bin")
+            .map(get_start_points_file);
         let pq_storage = PQStorage::new(&pq_pivot_path, &pq_compressed_data_path, None);
         let pq_pivot_table = pq_storage.load_pq_pivots_bin::<Storage>(
             &pq_pivot_path,
@@ -49,10 +55,30 @@ impl DiskIndexReader {
             metadata.npoints(),
             pq_pivot_table.get_num_chunks()
         );
+        let start_point_table = match start_point_path {
+            Some(path) => load_start_point_table(storage_provider, &path)?,
+            None => None,
+        };
+        if let Some(table) = &start_point_table {
+            if table.entry_vertices().iter().any(|&id| {
+                usize::try_from(id)
+                    .map(|id| id >= metadata.npoints())
+                    .unwrap_or(true)
+            }) {
+                return Err(ANNError::log_index_error(
+                    "start-point table contains an out-of-range vertex ID",
+                ));
+            }
+            info!(
+                "Loaded {} start-point centroids into memory",
+                table.num_centroids()
+            );
+        }
 
         Ok(DiskIndexReader {
             pq_data: Arc::<PQData>::new(PQData::new(pq_pivot_table, pq_compressed_data)?),
             num_points: metadata.npoints(),
+            start_point_table,
         })
     }
 
@@ -63,13 +89,44 @@ impl DiskIndexReader {
     pub fn get_num_points(&self) -> usize {
         self.num_points
     }
+
+    /// Return the query-dependent graph start points loaded with this index, if present.
+    pub fn get_start_point_table(&self) -> Option<&StartPointTable> {
+        self.start_point_table.as_ref()
+    }
+}
+
+fn load_start_point_table<Storage: StorageReadProvider>(
+    storage_provider: &Storage,
+    path: &str,
+) -> ANNResult<Option<StartPointTable>> {
+    if !storage_provider.exists(path) {
+        return Ok(None);
+    }
+
+    let len = usize::try_from(storage_provider.get_length(path)?).map_err(|_| {
+        ANNError::log_index_error(format_args!("start-point file {path} is too large"))
+    })?;
+    let mut bytes = vec![0u8; len];
+    storage_provider.open_reader(path)?.read_exact(&mut bytes)?;
+    let table = StartPointTable::from_bytes(&bytes).map_err(|err| {
+        ANNError::log_index_error(format_args!(
+            "failed to load start-point file {path}: {err}"
+        ))
+    })?;
+    Ok(Some(table))
 }
 
 #[cfg(test)]
 mod disk_index_storage_test {
+    use std::{io::Write, num::NonZeroUsize};
+
     use diskann::ANNErrorKind;
-    use diskann_providers::storage::VirtualStorageProvider;
+    use diskann_providers::storage::{StorageWriteProvider, VirtualStorageProvider};
+    use diskann_startpoints::{StartPointTable, StartPointsConfig};
     use diskann_utils::test_data_root;
+    use diskann_utils::views::MatrixView;
+    use diskann_vector::distance::Metric;
     use vfs::OverlayFS;
 
     use super::*;
@@ -120,5 +177,35 @@ mod disk_index_storage_test {
 
         let num_points = storage.get_num_points();
         assert_eq!(num_points, 25000);
+    }
+
+    #[test]
+    fn loads_optional_start_point_table() {
+        let storage_provider = VirtualStorageProvider::new_memory();
+        let data = [0.0f32, 0.0, 10.0, 10.0];
+        let data = MatrixView::try_from(&data[..], 2, 2).unwrap();
+        let config = StartPointsConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            0,
+            Metric::L2,
+        );
+        let table = StartPointTable::build(data, &config).unwrap().unwrap();
+        let path = "/index_start_points.bin";
+        let mut writer = storage_provider.create_for_write(path).unwrap();
+        writer.write_all(&table.to_bytes().unwrap()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            load_start_point_table(&storage_provider, path)
+                .unwrap()
+                .as_ref(),
+            Some(&table)
+        );
+        assert!(load_start_point_table(&storage_provider, "/missing")
+            .unwrap()
+            .is_none());
     }
 }

@@ -8,6 +8,7 @@
 use std::num::NonZeroUsize;
 
 use diskann::ANNError;
+use diskann_startpoints::StartPointsConfig;
 use thiserror::Error;
 
 use super::QuantizationType;
@@ -118,6 +119,9 @@ pub struct DiskIndexBuildParameters {
 
     /// Number of vectors processed per data-compression chunk.
     data_compression_chunk_vector_count: usize,
+
+    /// Optional configuration for persisted query-dependent graph start points.
+    start_points_config: Option<StartPointsConfig>,
 }
 
 impl DiskIndexBuildParameters {
@@ -132,6 +136,7 @@ impl DiskIndexBuildParameters {
             search_pq_chunks,
             build_quantization,
             data_compression_chunk_vector_count: DEFAULT_DATA_COMPRESSION_CHUNK_VECTOR_COUNT,
+            start_points_config: None,
         }
     }
 
@@ -141,6 +146,14 @@ impl DiskIndexBuildParameters {
         data_compression_chunk_vector_count: usize,
     ) -> Self {
         self.data_compression_chunk_vector_count = data_compression_chunk_vector_count;
+        self
+    }
+
+    /// Enable persisted query-dependent graph start points.
+    ///
+    /// Building the table temporarily loads a full `f32` copy of the dataset into memory.
+    pub fn with_start_points(mut self, config: StartPointsConfig) -> Self {
+        self.start_points_config = Some(config);
         self
     }
 
@@ -162,6 +175,11 @@ impl DiskIndexBuildParameters {
     /// Get the number of vectors processed per data-compression chunk.
     pub fn data_compression_chunk_vector_count(&self) -> usize {
         self.data_compression_chunk_vector_count
+    }
+
+    /// Get the query-dependent start-point configuration, when enabled.
+    pub fn start_points_config(&self) -> Option<StartPointsConfig> {
+        self.start_points_config
     }
 }
 
@@ -209,6 +227,25 @@ mod dataset_test {
         .with_data_compression_chunk_vector_count(10_000);
 
         assert_eq!(result.data_compression_chunk_vector_count(), 10_000);
+    }
+
+    #[test]
+    fn start_points_can_be_configured() {
+        let config = StartPointsConfig::new(
+            NonZeroUsize::new(16).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(25).unwrap(),
+            7,
+            diskann_vector::distance::Metric::L2,
+        );
+        let result = DiskIndexBuildParameters::new(
+            MemoryBudget::try_from_gb(2.0).unwrap(),
+            QuantizationType::default(),
+            NumPQChunks::new_with(20, 128).unwrap(),
+        )
+        .with_start_points(config);
+
+        assert_eq!(result.start_points_config(), Some(config));
     }
 
     #[test]

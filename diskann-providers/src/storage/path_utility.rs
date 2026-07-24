@@ -23,6 +23,10 @@ pub fn get_compressed_pq_file(index_path_prefix: &str) -> String {
     index_path_prefix.to_string() + "_pq_compressed.bin"
 }
 
+pub fn get_start_points_file(index_path_prefix: &str) -> String {
+    index_path_prefix.to_string() + "_start_points.bin"
+}
+
 pub fn get_disk_index_pq_pivot_file(index_path_prefix: &str) -> String {
     index_path_prefix.to_string() + "_disk.index_pq_pivots.bin"
 }
@@ -66,5 +70,13 @@ mod tests {
         let prefix = "test_prefix";
         let result = get_universal_label_file(prefix);
         assert_eq!(result, "test_prefix_universal_label.txt");
+    }
+
+    #[test]
+    fn test_get_start_points_file() {
+        assert_eq!(
+            get_start_points_file("test_prefix"),
+            "test_prefix_start_points.bin"
+        );
     }
 }

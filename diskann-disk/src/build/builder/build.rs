@@ -5,6 +5,7 @@
 
 //! Async disk index builder implementation.
 use std::{
+    io::Write,
     marker::PhantomData,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
@@ -12,10 +13,13 @@ use std::{
 
 use crate::data_model::GraphDataType;
 use diskann::{
+    error::IntoANNResult,
     utils::{async_tools, VectorRepr, ONE},
     ANNError, ANNResult,
 };
-use diskann_providers::storage::{StorageReadProvider, StorageWriteProvider};
+use diskann_providers::storage::{
+    get_start_points_file, StorageReadProvider, StorageWriteProvider,
+};
 use diskann_providers::{
     model::{
         graph::provider::async_::inmem::DefaultProviderParameters, IndexConfiguration,
@@ -27,6 +31,8 @@ use diskann_providers::{
         MAX_MEDOID_SAMPLE_SIZE,
     },
 };
+use diskann_startpoints::StartPointTable;
+use diskann_utils::{io::read_bin, views::Matrix};
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
@@ -129,6 +135,8 @@ where
         self.create_disk_layout()?;
         logger.log_checkpoint(DiskIndexBuildCheckpoint::DiskLayout);
 
+        self.build_start_points()?;
+
         Ok(())
     }
 
@@ -206,6 +214,76 @@ where
             .create_disk_layout::<Data, StorageProvider>(self.storage_provider)?;
         self.index_writer
             .index_build_cleanup(self.storage_provider)?;
+
+        Ok(())
+    }
+
+    fn build_start_points(&self) -> ANNResult<()> {
+        let path = get_start_points_file(&self.index_writer.get_index_path_prefix());
+        if self.storage_provider.exists(&path) {
+            self.storage_provider.delete(&path)?;
+        }
+
+        let Some(config) = self.disk_build_param.start_points_config() else {
+            return Ok(());
+        };
+        if !config.enabled {
+            return Ok(());
+        }
+        if config.metric != self.index_configuration.dist_metric {
+            return Err(ANNError::log_index_config_error(
+                "StartPointsConfig.metric".to_string(),
+                format!(
+                    "start-point metric {} does not match index metric {}",
+                    config.metric, self.index_configuration.dist_metric
+                ),
+            ));
+        }
+
+        let native_data = read_bin::<Data::VectorDataType>(
+            &mut self
+                .storage_provider
+                .open_reader(&self.index_writer.get_dataset_file())?,
+        )?;
+        if native_data.nrows() != self.index_configuration.max_points
+            || native_data.ncols() != self.index_configuration.dim
+        {
+            return Err(ANNError::log_index_error(format_args!(
+                "start-point data shape {}x{} does not match index shape {}x{}",
+                native_data.nrows(),
+                native_data.ncols(),
+                self.index_configuration.max_points,
+                self.index_configuration.dim
+            )));
+        }
+
+        let mut data = Matrix::new(
+            0.0f32,
+            self.index_configuration.max_points,
+            self.index_configuration.dim,
+        );
+        for (source, destination) in native_data.row_iter().zip(data.row_iter_mut()) {
+            Data::VectorDataType::as_f32_into(source, destination).into_ann_result()?;
+        }
+
+        let table = StartPointTable::build(data.as_view(), &config)
+            .map_err(|err| {
+                ANNError::log_index_error(format_args!("failed to build start-point table: {err}"))
+            })?
+            .ok_or_else(|| {
+                ANNError::log_index_error("enabled start-point configuration produced no table")
+            })?;
+        let bytes = table.to_bytes().map_err(|err| {
+            ANNError::log_index_error(format_args!("failed to encode start-point table: {err}"))
+        })?;
+        let mut writer = self.storage_provider.create_for_write(&path)?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        info!(
+            "Saved {} start-point centroids to {}",
+            table.num_centroids(),
+            path
+        );
 
         Ok(())
     }

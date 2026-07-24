@@ -537,7 +537,7 @@ pub(crate) fn determine_build_strategy<Data: GraphDataType>(
 
 #[cfg(test)]
 pub(crate) mod disk_index_builder_tests {
-    use std::{io::Read, sync::Arc, time::Instant};
+    use std::{io::Read, num::NonZeroUsize, sync::Arc, time::Instant};
 
     use crate::test_utils::{GraphDataF32VectorU32Data, GraphDataF32VectorUnitData};
     use diskann::{
@@ -547,10 +547,11 @@ pub(crate) mod disk_index_builder_tests {
     };
     use diskann_providers::storage::VirtualStorageProvider;
     use diskann_providers::storage::{
-        get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file,
+        get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, get_start_points_file,
     };
+    use diskann_startpoints::StartPointsConfig;
 
-    use diskann_utils::test_data_root;
+    use diskann_utils::{io::write_bin, test_data_root, views::MatrixView};
     use diskann_vector::{
         distance::Metric::{self, L2},
         DistanceFunction,
@@ -588,6 +589,7 @@ pub(crate) mod disk_index_builder_tests {
         pub associated_data_path: Option<String>,
         pub index_build_ram_gb: f64,
         pub data_compression_chunk_vector_count: Option<usize>,
+        pub start_points_config: Option<StartPointsConfig>,
         pub num_threads: usize,
         pub metric: Metric,
         pub block_size: usize,
@@ -607,6 +609,7 @@ pub(crate) mod disk_index_builder_tests {
                 associated_data_path: None,
                 index_build_ram_gb: 1.0,
                 data_compression_chunk_vector_count: None,
+                start_points_config: None,
                 num_threads: 1,
                 metric: L2,
                 block_size: DEFAULT_DISK_SECTOR_LEN,
@@ -674,6 +677,9 @@ pub(crate) mod disk_index_builder_tests {
             if let Some(chunk_vector_count) = self.params.data_compression_chunk_vector_count {
                 disk_index_build_parameters = disk_index_build_parameters
                     .with_data_compression_chunk_vector_count(chunk_vector_count);
+            }
+            if let Some(config) = self.params.start_points_config {
+                disk_index_build_parameters = disk_index_build_parameters.with_start_points(config);
             }
 
             let config = config::Builder::new_with(
@@ -845,6 +851,70 @@ pub(crate) mod disk_index_builder_tests {
             &fixture.storage_provider,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_build_persists_and_loads_start_points() {
+        let storage_provider = VirtualStorageProvider::new_memory();
+        let data_path = "/start_points_data.fbin";
+        let dim = 8;
+        let values: Vec<f32> = (0..256)
+            .flat_map(|row| (0..dim).map(move |col| (row * dim + col) as f32))
+            .collect();
+        let data = MatrixView::try_from(values.as_slice(), 256, dim).unwrap();
+        let mut writer = storage_provider.create_for_write(data_path).unwrap();
+        write_bin(data, &mut writer).unwrap();
+        drop(writer);
+
+        let index_path_prefix = "/start_points_index".to_string();
+        let config = StartPointsConfig::new(
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(8).unwrap(),
+            0,
+            L2,
+        );
+        let params = TestParams {
+            dim,
+            full_dim: dim,
+            num_pq_chunks: dim,
+            data_path: data_path.to_string(),
+            index_path_prefix: index_path_prefix.clone(),
+            start_points_config: Some(config),
+            ..TestParams::default()
+        };
+        let fixture = IndexBuildFixture::new(storage_provider, params).unwrap();
+        fixture.build::<GraphDataF32VectorUnitData>().unwrap();
+
+        let start_points_path = get_start_points_file(&index_path_prefix);
+        assert!(fixture.storage_provider.exists(&start_points_path));
+
+        let index_reader = DiskIndexReader::new(
+            get_pq_pivot_file(&index_path_prefix),
+            get_compressed_pq_file(&index_path_prefix),
+            fixture.storage_provider.as_ref(),
+        )
+        .unwrap();
+        assert!(index_reader.get_start_point_table().is_some());
+
+        let vertex_provider_factory = DiskVertexProviderFactory::new(
+            VirtualAlignedReaderFactory::new(
+                get_disk_index_file(&index_path_prefix),
+                Arc::clone(&fixture.storage_provider),
+            ),
+            CachingStrategy::None,
+        )
+        .unwrap();
+        let searcher = DiskIndexSearcher::<GraphDataF32VectorUnitData, _>::new(
+            1,
+            usize::MAX,
+            &index_reader,
+            vertex_provider_factory,
+            L2,
+            None,
+        )
+        .unwrap();
+        assert!(searcher.entry_table().is_some());
     }
 
     #[test]
