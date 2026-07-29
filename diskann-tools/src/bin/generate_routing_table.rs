@@ -7,7 +7,9 @@ use std::num::NonZeroUsize;
 
 use anyhow::Result;
 use clap::Parser;
-use diskann_disk::routing::{generate_routing_table, generate_routing_table_pq};
+use diskann_disk::routing::{
+    generate_routing_table, generate_routing_table_pq, generate_routing_table_pq_block_first,
+};
 use diskann_providers::{
     storage::FileStorageProvider,
     utils::{create_rnd_from_optional_seed, create_thread_pool},
@@ -61,6 +63,13 @@ struct Args {
     #[arg(long = "pq-compressed-file", requires = "pq_pivots_file")]
     pq_compressed_file: Option<String>,
 
+    /// Disk index whose physical block-first nodes are the only eligible PQ routing points.
+    #[arg(
+        long = "block-first-disk-index-file",
+        requires_all = ["pq_pivots_file", "pq_compressed_file"]
+    )]
+    block_first_disk_index_file: Option<String>,
+
     /// Distance metric for routing construction. PQ-space routing defaults to innerproduct;
     /// raw-data routing supports only l2.
     #[arg(long = "distance")]
@@ -75,18 +84,33 @@ where
     let pool = create_thread_pool(get_num_threads(args.num_threads))?;
     let mut rng = create_rnd_from_optional_seed(args.random_seed);
     let table = match (&args.pq_pivots_file, &args.pq_compressed_file) {
-        (Some(pivots), Some(compressed)) => generate_routing_table_pq(
-            pivots,
-            compressed,
-            &args.output_file,
-            args.distance.unwrap_or(Metric::InnerProduct),
-            args.num_centers,
-            args.sampling_rate,
-            args.max_kmeans_reps,
-            &storage,
-            &mut rng,
-            pool.as_ref(),
-        )?,
+        (Some(pivots), Some(compressed)) => match &args.block_first_disk_index_file {
+            Some(disk_index) => generate_routing_table_pq_block_first(
+                pivots,
+                compressed,
+                disk_index,
+                &args.output_file,
+                args.distance.unwrap_or(Metric::InnerProduct),
+                args.num_centers,
+                args.sampling_rate,
+                args.max_kmeans_reps,
+                &storage,
+                &mut rng,
+                pool.as_ref(),
+            )?,
+            None => generate_routing_table_pq(
+                pivots,
+                compressed,
+                &args.output_file,
+                args.distance.unwrap_or(Metric::InnerProduct),
+                args.num_centers,
+                args.sampling_rate,
+                args.max_kmeans_reps,
+                &storage,
+                &mut rng,
+                pool.as_ref(),
+            )?,
+        },
         _ => {
             if args.distance.is_some_and(|metric| metric != Metric::L2) {
                 anyhow::bail!("raw-data routing supports only --distance l2");

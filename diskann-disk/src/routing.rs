@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashSet,
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     num::NonZeroUsize,
 };
 
@@ -20,10 +20,55 @@ use diskann_providers::{
 use diskann_vector::{distance::Metric, DistanceFunction};
 use rand::Rng;
 
-use crate::utils::{compute_closest_centers, k_means_clustering, spherical_k_means_clustering};
+use crate::{
+    data_model::GraphHeader,
+    utils::{compute_closest_centers, k_means_clustering, spherical_k_means_clustering},
+};
 
 const ROUTING_TABLE_MAGIC: &[u8; 8] = b"DANNRTE1";
 const REPRESENTATIVE_BATCH_SIZE: usize = 1_200;
+const DISK_INDEX_BINARY_PREFIX_SIZE: usize = 2 * std::mem::size_of::<u32>();
+const DEFAULT_DISK_BLOCK_SIZE: u64 = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutingCandidateIds {
+    num_points: usize,
+    stride: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyReorderLayout {
+    start_block: u64,
+    vectors_per_block: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskBlockLayout {
+    num_points: u64,
+    routing_dimension: Option<usize>,
+    node_len: u64,
+    nodes_per_block: u64,
+    block_size: u64,
+    declared_file_size: u64,
+    legacy_reorder: Option<LegacyReorderLayout>,
+}
+
+impl RoutingCandidateIds {
+    fn all(num_points: usize) -> Self {
+        Self {
+            num_points,
+            stride: 1,
+        }
+    }
+
+    fn len(self) -> usize {
+        self.num_points.div_ceil(self.stride)
+    }
+
+    fn iter(self) -> impl Iterator<Item = usize> {
+        (0..self.num_points).step_by(self.stride)
+    }
+}
 
 /// In-memory vectors and graph IDs used to choose query-specific graph entry points.
 #[derive(Debug, Clone)]
@@ -357,6 +402,74 @@ pub fn generate_routing_table_pq<P>(
 where
     P: StorageReadProvider + StorageWriteProvider,
 {
+    generate_routing_table_pq_from_candidates(
+        pq_pivots_path,
+        pq_compressed_path,
+        output_path,
+        metric,
+        num_centers,
+        sampling_rate,
+        max_kmeans_reps,
+        None,
+        storage_provider,
+        rng,
+        pool,
+    )
+}
+
+/// Generate a Search-PQ routing table using only the first node in each physical disk block.
+///
+/// The disk graph is not reordered. This variant reads its block layout from `disk_index_path`,
+/// trains k-means on block-first node IDs, and restricts routing representatives to those IDs.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_routing_table_pq_block_first<P>(
+    pq_pivots_path: &str,
+    pq_compressed_path: &str,
+    disk_index_path: &str,
+    output_path: &str,
+    metric: Metric,
+    num_centers: NonZeroUsize,
+    sampling_rate: f64,
+    max_kmeans_reps: NonZeroUsize,
+    storage_provider: &P,
+    rng: &mut impl Rng,
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<RoutingTable>
+where
+    P: StorageReadProvider + StorageWriteProvider,
+{
+    generate_routing_table_pq_from_candidates(
+        pq_pivots_path,
+        pq_compressed_path,
+        output_path,
+        metric,
+        num_centers,
+        sampling_rate,
+        max_kmeans_reps,
+        Some(disk_index_path),
+        storage_provider,
+        rng,
+        pool,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_routing_table_pq_from_candidates<P>(
+    pq_pivots_path: &str,
+    pq_compressed_path: &str,
+    output_path: &str,
+    metric: Metric,
+    num_centers: NonZeroUsize,
+    sampling_rate: f64,
+    max_kmeans_reps: NonZeroUsize,
+    block_first_disk_index_path: Option<&str>,
+    storage_provider: &P,
+    rng: &mut impl Rng,
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<RoutingTable>
+where
+    P: StorageReadProvider + StorageWriteProvider,
+{
     if !(0.0 < sampling_rate && sampling_rate <= 1.0) {
         return Err(ANNError::log_index_config_error(
             "routing_sampling_rate".into(),
@@ -379,11 +492,17 @@ where
         storage_provider,
     )?;
 
-    if num_points < num_centers.get() {
+    let candidate_ids = block_first_disk_index_path
+        .map(|path| block_first_candidate_ids(path, num_points, dim, storage_provider))
+        .transpose()?
+        .unwrap_or_else(|| RoutingCandidateIds::all(num_points));
+    let num_candidates = candidate_ids.len();
+
+    if num_candidates < num_centers.get() {
         return Err(ANNError::log_index_config_error(
             "routing_num_centers".into(),
             format!(
-                "{num_points} points are insufficient for {} centers",
+                "{num_candidates} eligible points are insufficient for {} centers",
                 num_centers.get()
             ),
         ));
@@ -409,12 +528,12 @@ where
 
     // Training set: reconstruct a random sample. MIPS uses unit-normalized vectors for
     // spherical k-means; L2 preserves the reconstructed magnitudes.
-    let num_train = (((num_points as f64) * sampling_rate).round() as usize)
+    let num_train = (((num_candidates as f64) * sampling_rate).round() as usize)
         .max(num_centers.get())
-        .min(num_points);
-    let mut sampled: Vec<usize> = (0..num_points).collect();
+        .min(num_candidates);
+    let mut sampled = candidate_ids.iter().collect::<Vec<_>>();
     for i in 0..num_train {
-        let j = rng.random_range(i..num_points);
+        let j = rng.random_range(i..num_candidates);
         sampled.swap(i, j);
     }
     sampled.truncate(num_train);
@@ -469,7 +588,7 @@ where
     let mut best_score = vec![initial_score; num_centers.get()];
     let mut rep_ids = vec![0u32; num_centers.get()];
     let mut rep_vectors = vec![0.0f32; num_centers.get() * dim];
-    for id in 0..num_points {
+    let mut assign_representative = |id: usize| -> ANNResult<()> {
         reconstruct(id, &mut buf)?;
         let mut best_c = 0usize;
         let mut best_value = initial_score;
@@ -502,6 +621,10 @@ where
             })?;
             rep_vectors[best_c * dim..(best_c + 1) * dim].copy_from_slice(&buf);
         }
+        Ok(())
+    };
+    for id in candidate_ids.iter() {
+        assign_representative(id)?;
     }
 
     // Drop empty regions (rare for small k), keeping only populated representatives.
@@ -519,14 +642,381 @@ where
     Ok(table)
 }
 
+fn block_first_candidate_ids<P>(
+    disk_index_path: &str,
+    expected_num_points: usize,
+    expected_dimension: usize,
+    storage_provider: &P,
+) -> ANNResult<RoutingCandidateIds>
+where
+    P: StorageReadProvider,
+{
+    let minimum_file_size = DISK_INDEX_BINARY_PREFIX_SIZE
+        .checked_add(GraphHeader::get_size())
+        .ok_or_else(|| ANNError::log_invalid_file_format("disk header size overflow"))?;
+    let actual_file_size = storage_provider.get_length(disk_index_path)?;
+    if actual_file_size < minimum_file_size as u64 {
+        return Err(ANNError::log_invalid_file_format(format!(
+            "disk index '{disk_index_path}' is too small to contain a graph header"
+        )));
+    }
+
+    let mut reader = storage_provider.open_reader(disk_index_path)?;
+    let mut header_bytes = vec![0u8; minimum_file_size];
+    reader.read_exact(&mut header_bytes)?;
+    let layout = parse_disk_block_layout(&header_bytes[DISK_INDEX_BINARY_PREFIX_SIZE..])?;
+    let num_points = usize::try_from(layout.num_points)
+        .map_err(|_| ANNError::log_invalid_file_format("disk point count exceeds usize"))?;
+    if num_points != expected_num_points {
+        return Err(ANNError::log_index_error(format!(
+            "disk index contains {num_points} points but PQ codes contain {expected_num_points}"
+        )));
+    }
+    if let Some(dimension) = layout.routing_dimension {
+        if dimension != expected_dimension {
+            return Err(ANNError::log_index_error(format!(
+                "disk index dimension is {dimension} but PQ pivots use dimension {expected_dimension}"
+            )));
+        }
+    }
+    if num_points == 0 {
+        return Err(ANNError::log_invalid_file_format(
+            "disk index contains no points",
+        ));
+    }
+    if layout.routing_dimension == Some(0) {
+        return Err(ANNError::log_invalid_file_format(
+            "disk index dimension is zero",
+        ));
+    }
+    if layout.block_size < minimum_file_size as u64 {
+        return Err(ANNError::log_invalid_file_format(format!(
+            "disk block size {} is too small for the {minimum_file_size}-byte graph header",
+            layout.block_size
+        )));
+    }
+
+    if layout.node_len == 0 {
+        return Err(ANNError::log_invalid_file_format(
+            "disk index node length is zero",
+        ));
+    }
+
+    let nodes_per_block = layout.nodes_per_block;
+    let stride = if nodes_per_block == 0 {
+        if layout.node_len <= layout.block_size {
+            return Err(ANNError::log_invalid_file_format(format!(
+                "disk index reports multi-block nodes but node length {} fits in block size {}",
+                layout.node_len, layout.block_size
+            )));
+        }
+        1
+    } else {
+        let expected_nodes_per_block = layout.block_size / layout.node_len;
+        if expected_nodes_per_block != nodes_per_block {
+            return Err(ANNError::log_invalid_file_format(format!(
+                "disk index reports {nodes_per_block} nodes per block, expected {expected_nodes_per_block} from block size {} and node length {}",
+                layout.block_size, layout.node_len
+            )));
+        }
+        usize::try_from(nodes_per_block)
+            .map_err(|_| ANNError::log_invalid_file_format("block stride exceeds usize"))?
+    };
+
+    let data_blocks = if nodes_per_block > 0 {
+        layout.num_points.div_ceil(nodes_per_block)
+    } else {
+        let blocks_per_node = layout.node_len.div_ceil(layout.block_size);
+        layout
+            .num_points
+            .checked_mul(blocks_per_node)
+            .ok_or_else(|| ANNError::log_invalid_file_format("disk block count overflow"))?
+    };
+    let graph_span = data_blocks
+        .checked_add(1)
+        .and_then(|blocks| blocks.checked_mul(layout.block_size))
+        .ok_or_else(|| ANNError::log_invalid_file_format("disk index size overflow"))?;
+    let minimum_layout_span = match layout.legacy_reorder {
+        Some(reorder) => {
+            let expected_start_block = data_blocks
+                .checked_add(1)
+                .ok_or_else(|| ANNError::log_invalid_file_format("disk block count overflow"))?;
+            if reorder.start_block != expected_start_block {
+                return Err(ANNError::log_invalid_file_format(format!(
+                    "legacy reorder data starts at block {}, expected {expected_start_block}",
+                    reorder.start_block
+                )));
+            }
+            let reorder_dimension = layout.routing_dimension.ok_or_else(|| {
+                ANNError::log_invalid_file_format(
+                    "legacy reorder metadata is missing its vector dimension",
+                )
+            })?;
+            let vector_bytes = u64::try_from(reorder_dimension)
+                .ok()
+                .and_then(|dimension| dimension.checked_mul(std::mem::size_of::<f32>() as u64))
+                .ok_or_else(|| {
+                    ANNError::log_invalid_file_format("legacy reorder vector size overflow")
+                })?;
+            let expected_vectors_per_block = layout.block_size / vector_bytes;
+            if expected_vectors_per_block == 0
+                || reorder.vectors_per_block != expected_vectors_per_block
+            {
+                return Err(ANNError::log_invalid_file_format(format!(
+                    "legacy reorder metadata reports {} vectors per block, expected {expected_vectors_per_block}",
+                    reorder.vectors_per_block
+                )));
+            }
+            let reorder_blocks = layout.num_points.div_ceil(reorder.vectors_per_block);
+            reorder
+                .start_block
+                .checked_add(reorder_blocks)
+                .and_then(|blocks| blocks.checked_mul(layout.block_size))
+                .ok_or_else(|| ANNError::log_invalid_file_format("disk index size overflow"))?
+        }
+        None => graph_span,
+    };
+    if layout.declared_file_size < minimum_layout_span
+        || actual_file_size < layout.declared_file_size
+    {
+        return Err(ANNError::log_invalid_file_format(format!(
+            "disk index size is inconsistent: header {}, actual file {actual_file_size}, minimum layout span {minimum_layout_span}",
+            layout.declared_file_size
+        )));
+    }
+
+    Ok(RoutingCandidateIds { num_points, stride })
+}
+
+fn parse_disk_block_layout(header_bytes: &[u8]) -> ANNResult<DiskBlockLayout> {
+    if header_bytes.len() < GraphHeader::get_size() {
+        return Err(ANNError::log_invalid_file_format(
+            "disk graph header is truncated",
+        ));
+    }
+
+    let mut cursor = Cursor::new(header_bytes);
+    let num_points = cursor.read_u64::<LittleEndian>()?;
+    let graph_dimension = cursor.read_u64::<LittleEndian>()?;
+    let _medoid = cursor.read_u64::<LittleEndian>()?;
+    let node_len = cursor.read_u64::<LittleEndian>()?;
+    let nodes_per_block = cursor.read_u64::<LittleEndian>()?;
+    let _num_frozen = cursor.read_u64::<LittleEndian>()?;
+    let _frozen_location = cursor.read_u64::<LittleEndian>()?;
+    let append_reorder_data = cursor.read_u64::<LittleEndian>()?;
+
+    if append_reorder_data == 0 {
+        let header = GraphHeader::try_from(header_bytes)?;
+        let version = header.layout_version();
+        let is_legacy = version.major_version() == 0 && version.minor_version() == 0;
+        if !is_legacy && version != &GraphHeader::CURRENT_LAYOUT_VERSION {
+            return Err(ANNError::log_invalid_file_format(format!(
+                "unsupported graph layout version {version}"
+            )));
+        }
+        let block_size = if is_legacy {
+            DEFAULT_DISK_BLOCK_SIZE
+        } else {
+            header.block_size()
+        };
+        return Ok(DiskBlockLayout {
+            num_points,
+            routing_dimension: if is_legacy {
+                None
+            } else {
+                Some(usize::try_from(graph_dimension).map_err(|_| {
+                    ANNError::log_invalid_file_format("disk dimension exceeds usize")
+                })?)
+            },
+            node_len,
+            nodes_per_block,
+            block_size,
+            declared_file_size: header.metadata().disk_index_file_size,
+            legacy_reorder: None,
+        });
+    }
+    if append_reorder_data != 1 {
+        return Err(ANNError::log_invalid_file_format(format!(
+            "disk index has invalid append_reorder_data value {append_reorder_data}"
+        )));
+    }
+
+    let start_block = cursor.read_u64::<LittleEndian>()?;
+    let reorder_dimension = cursor.read_u64::<LittleEndian>()?;
+    let vectors_per_block = cursor.read_u64::<LittleEndian>()?;
+    let declared_file_size = cursor.read_u64::<LittleEndian>()?;
+    Ok(DiskBlockLayout {
+        num_points,
+        routing_dimension: Some(
+            usize::try_from(reorder_dimension)
+                .map_err(|_| ANNError::log_invalid_file_format("disk dimension exceeds usize"))?,
+        ),
+        node_len,
+        nodes_per_block,
+        block_size: DEFAULT_DISK_BLOCK_SIZE,
+        declared_file_size,
+        legacy_reorder: Some(LegacyReorderLayout {
+            start_block,
+            vectors_per_block,
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{io::Write, num::NonZeroUsize};
 
-    use diskann_providers::storage::VirtualStorageProvider;
+    use diskann_providers::storage::{StorageWriteProvider, VirtualStorageProvider};
     use diskann_vector::distance::Metric;
 
+    use crate::data_model::{GraphLayoutVersion, GraphMetadata};
+
     use super::*;
+
+    fn write_test_disk_index<P>(
+        storage: &P,
+        path: &str,
+        num_points: u64,
+        block_size: u64,
+        node_len: u64,
+        nodes_per_block: u64,
+    ) where
+        P: StorageWriteProvider,
+    {
+        write_test_disk_index_with_layout(
+            storage,
+            path,
+            num_points,
+            block_size,
+            block_size,
+            node_len,
+            nodes_per_block,
+            GraphLayoutVersion::new(1, 0),
+            0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_test_disk_index_with_layout<P>(
+        storage: &P,
+        path: &str,
+        num_points: u64,
+        effective_block_size: u64,
+        stored_block_size: u64,
+        node_len: u64,
+        nodes_per_block: u64,
+        layout_version: GraphLayoutVersion,
+        trailing_bytes: usize,
+    ) where
+        P: StorageWriteProvider,
+    {
+        let data_blocks = if nodes_per_block > 0 {
+            num_points.div_ceil(nodes_per_block)
+        } else {
+            num_points * node_len.div_ceil(effective_block_size)
+        };
+        let disk_size = (data_blocks + 1) * effective_block_size;
+        let metadata = GraphMetadata::new(
+            num_points,
+            8,
+            0,
+            node_len,
+            nodes_per_block,
+            0,
+            0,
+            disk_size,
+            0,
+        );
+        let header = GraphHeader::new(metadata, stored_block_size, layout_version)
+            .to_bytes()
+            .unwrap();
+        let mut bytes = vec![0u8; disk_size as usize + trailing_bytes];
+        bytes[DISK_INDEX_BINARY_PREFIX_SIZE..DISK_INDEX_BINARY_PREFIX_SIZE + header.len()]
+            .copy_from_slice(&header);
+        let mut writer = storage.create_for_write(path).unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn write_legacy_reordered_test_disk_index<P>(
+        storage: &P,
+        path: &str,
+        num_points: u64,
+        dimension: u64,
+        node_len: u64,
+        nodes_per_block: u64,
+    ) where
+        P: StorageWriteProvider,
+    {
+        let data_blocks = num_points.div_ceil(nodes_per_block);
+        let reorder_start_block = data_blocks + 1;
+        let vectors_per_block =
+            DEFAULT_DISK_BLOCK_SIZE / (dimension * std::mem::size_of::<f32>() as u64);
+        let reorder_blocks = num_points.div_ceil(vectors_per_block);
+        let disk_size = (reorder_start_block + reorder_blocks) * DEFAULT_DISK_BLOCK_SIZE;
+        let fields = [
+            num_points,
+            16,
+            0,
+            node_len,
+            nodes_per_block,
+            0,
+            0,
+            1,
+            reorder_start_block,
+            dimension,
+            vectors_per_block,
+            disk_size,
+        ];
+        let mut bytes = vec![0u8; disk_size as usize];
+        let mut header = vec![];
+        for field in fields {
+            header.write_u64::<LittleEndian>(field).unwrap();
+        }
+        bytes[DISK_INDEX_BINARY_PREFIX_SIZE..DISK_INDEX_BINARY_PREFIX_SIZE + header.len()]
+            .copy_from_slice(&header);
+        let mut writer = storage.create_for_write(path).unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn write_legacy_nonreordered_test_disk_index<P>(
+        storage: &P,
+        path: &str,
+        num_points: u64,
+        graph_dimension: u64,
+        node_len: u64,
+        nodes_per_block: u64,
+    ) where
+        P: StorageWriteProvider,
+    {
+        let data_blocks = num_points.div_ceil(nodes_per_block);
+        let disk_size = (data_blocks + 1) * DEFAULT_DISK_BLOCK_SIZE;
+        let fields = [
+            num_points,
+            graph_dimension,
+            0,
+            node_len,
+            nodes_per_block,
+            0,
+            0,
+            0,
+            disk_size,
+            0,
+            0,
+            0,
+        ];
+        let mut bytes = vec![0u8; disk_size as usize];
+        let mut header = vec![];
+        for field in fields {
+            header.write_u64::<LittleEndian>(field).unwrap();
+        }
+        bytes[DISK_INDEX_BINARY_PREFIX_SIZE..DISK_INDEX_BINARY_PREFIX_SIZE + header.len()]
+            .copy_from_slice(&header);
+        let mut writer = storage.create_for_write(path).unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.flush().unwrap();
+    }
 
     #[test]
     fn routing_table_round_trip_and_selection() {
@@ -568,5 +1058,211 @@ mod tests {
                 .unwrap(),
             vec![30]
         );
+    }
+
+    #[test]
+    fn block_first_candidates_use_physical_block_stride() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index(&storage, "/disk.index", 21, 4096, 1000, 4);
+
+        assert_eq!(
+            block_first_candidate_ids("/disk.index", 21, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8, 12, 16, 20]
+        );
+    }
+
+    #[test]
+    fn block_first_stride_one_matches_all_nodes() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index(&storage, "/one-per-block.index", 5, 4096, 3000, 1);
+        write_test_disk_index(&storage, "/multi-block.index", 5, 4096, 5000, 0);
+        let expected = vec![0, 1, 2, 3, 4];
+
+        assert_eq!(
+            block_first_candidate_ids("/one-per-block.index", 5, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            block_first_candidate_ids("/multi-block.index", 5, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn block_first_candidates_reject_point_count_mismatch() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index(&storage, "/disk.index", 5, 4096, 1000, 4);
+
+        let error = block_first_candidate_ids("/disk.index", 6, 8, &storage).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disk index contains 5 points but PQ codes contain 6"));
+    }
+
+    #[test]
+    fn block_first_candidates_reject_inconsistent_layout() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index(&storage, "/disk.index", 10, 4096, 1000, 3);
+
+        let error = block_first_candidate_ids("/disk.index", 10, 8, &storage).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reports 3 nodes per block, expected 4"));
+    }
+
+    #[test]
+    fn block_first_candidates_use_legacy_block_size_fallback() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index_with_layout(
+            &storage,
+            "/legacy.index",
+            10,
+            DEFAULT_DISK_BLOCK_SIZE,
+            0,
+            1000,
+            4,
+            GraphLayoutVersion::new(0, 0),
+            0,
+        );
+
+        assert_eq!(
+            block_first_candidate_ids("/legacy.index", 10, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8]
+        );
+    }
+
+    #[test]
+    fn block_first_candidates_allow_trailing_payload() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index_with_layout(
+            &storage,
+            "/trailing-payload.index",
+            10,
+            4096,
+            4096,
+            1000,
+            4,
+            GraphLayoutVersion::new(1, 0),
+            128,
+        );
+
+        assert_eq!(
+            block_first_candidate_ids("/trailing-payload.index", 10, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8]
+        );
+    }
+
+    #[test]
+    fn block_first_candidates_parse_legacy_reorder_header() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_legacy_reordered_test_disk_index(&storage, "/legacy-reordered.index", 10, 8, 1000, 4);
+
+        assert_eq!(
+            block_first_candidate_ids("/legacy-reordered.index", 10, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8]
+        );
+    }
+
+    #[test]
+    fn block_first_candidates_allow_legacy_disk_pq_dimension() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_legacy_nonreordered_test_disk_index(
+            &storage,
+            "/legacy-disk-pq.index",
+            10,
+            4,
+            1000,
+            4,
+        );
+
+        assert_eq!(
+            block_first_candidate_ids("/legacy-disk-pq.index", 10, 8, &storage)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8]
+        );
+    }
+
+    #[test]
+    fn block_first_candidates_reject_unknown_layout_version() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index_with_layout(
+            &storage,
+            "/future.index",
+            10,
+            4096,
+            4096,
+            1000,
+            4,
+            GraphLayoutVersion::new(2, 0),
+            0,
+        );
+
+        let error = block_first_candidate_ids("/future.index", 10, 8, &storage).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported graph layout version 2.0"));
+    }
+
+    #[test]
+    fn block_first_candidates_reject_header_overlapping_graph_data() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index(&storage, "/tiny-block.index", 2, 96, 80, 1);
+
+        let error = block_first_candidate_ids("/tiny-block.index", 2, 8, &storage).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("block size 96 is too small for the 104-byte graph header"));
+    }
+
+    #[test]
+    fn block_first_candidates_reject_zero_current_block_size() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index_with_layout(
+            &storage,
+            "/zero-block.index",
+            10,
+            4096,
+            0,
+            1000,
+            4,
+            GraphLayoutVersion::new(1, 0),
+            0,
+        );
+
+        let error = block_first_candidate_ids("/zero-block.index", 10, 8, &storage).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("block size 0 is too small for the 104-byte graph header"));
+    }
+
+    #[test]
+    fn block_first_candidates_reject_dimension_mismatch() {
+        let storage = VirtualStorageProvider::new_memory();
+        write_test_disk_index(&storage, "/disk.index", 10, 4096, 1000, 4);
+
+        let error = block_first_candidate_ids("/disk.index", 10, 7, &storage).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disk index dimension is 8 but PQ pivots use dimension 7"));
     }
 }

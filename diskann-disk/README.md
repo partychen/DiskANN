@@ -81,6 +81,13 @@ To cluster Search-PQ reconstructed vectors instead of the original data, pass
 `--pq-pivots-file`, `--pq-compressed-file`, and `--distance l2` or
 `--distance innerproduct`.
 
+For block-aligned routing experiments, add
+`--block-first-disk-index-file /path/to/index_disk.index`. This restricts both k-means
+training and real routing representatives to the first node ID stored in each physical
+disk block. It does not reorder the graph or imply that nodes sharing a block are vector
+neighbors. When the layout stores one node per block (or one node across multiple blocks),
+the eligible node set is unchanged.
+
 ### Data Model Module
 
 - Graph headers, metadata, layout versioning, and caching structures
