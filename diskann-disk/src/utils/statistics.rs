@@ -24,6 +24,12 @@ pub struct QueryStatistics {
     /// Total number of IO operations issued.
     pub total_io_operations: u32,
 
+    /// Total number of physical graph-index blocks spanned by IO operations.
+    pub physical_blocks_read: u64,
+
+    /// Total bytes read from the graph index.
+    pub physical_bytes_read: u64,
+
     /// Number of graph-frontier nodes requested for traversal.
     pub frontier_nodes_requested: u32,
 

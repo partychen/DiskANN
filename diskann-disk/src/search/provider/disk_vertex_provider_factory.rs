@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::{
     data_model::{Cache, CachingStrategy, GraphHeader},
+    layout::{load_physical_layout, PhysicalLayout},
     search::provider::aligned_file_reader::{
         traits::{AlignedFileReader, AlignedReaderFactory},
         AlignedFileReaderFactory, AlignedRead,
@@ -39,6 +40,8 @@ pub struct DiskVertexProviderFactory<
     pub aligned_reader_factory: ReaderFactory,
     pub caching_strategy: CachingStrategy,
     pub cache: Option<Arc<Cache<Data>>>,
+    physical_layout: Option<Arc<PhysicalLayout>>,
+    physical_layout_load_time_us: u128,
 }
 
 /// DiskVertexProviderFactory. This is one of the implementations for the `VertexProviderFactory` trait, for which the associated graph data is read from disk.
@@ -78,21 +81,23 @@ where
         let sector_reader = self.aligned_reader_factory.build()?;
         match self.caching_strategy {
             CachingStrategy::StaticCacheWithBfsNodes(_) => match self.cache {
-                Some(ref cache) => CachedDiskVertexProvider::new(
+                Some(ref cache) => CachedDiskVertexProvider::new_with_layout(
                     header,
                     max_batch_size,
                     sector_reader,
                     cache.clone(),
+                    self.physical_layout.clone(),
                 ),
                 None => Err(ANNError::log_index_error(
                     "Cache must be initialised for StaticCacheWithBfsNodes caching strategy",
                 )),
             },
-            CachingStrategy::None => CachedDiskVertexProvider::new(
+            CachingStrategy::None => CachedDiskVertexProvider::new_with_layout(
                 header,
                 max_batch_size,
                 sector_reader,
                 Arc::new(Cache::new(0, 0)?),
+                self.physical_layout.clone(),
             ),
         }
     }
@@ -107,9 +112,17 @@ impl<Data: GraphDataType<VectorIdType = u32>>
         disk_index_path: String,
         caching_strategy: CachingStrategy,
     ) -> ANNResult<Self> {
-        Self::new(
+        let timer = Instant::now();
+        let physical_layout =
+            load_physical_layout(&disk_index_path, None).map_err(ANNError::log_index_error)?;
+        let physical_layout_load_time_us = physical_layout
+            .as_ref()
+            .map_or(0, |_| timer.elapsed().as_micros());
+        Self::new_with_layout(
             AlignedFileReaderFactory::new(disk_index_path),
             caching_strategy,
+            physical_layout,
+            physical_layout_load_time_us,
         )
     }
 }
@@ -122,10 +135,21 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         aligned_reader_factory: ReaderFactory,
         caching_strategy: CachingStrategy,
     ) -> ANNResult<Self> {
+        Self::new_with_layout(aligned_reader_factory, caching_strategy, None, 0)
+    }
+
+    fn new_with_layout(
+        aligned_reader_factory: ReaderFactory,
+        caching_strategy: CachingStrategy,
+        physical_layout: Option<Arc<PhysicalLayout>>,
+        physical_layout_load_time_us: u128,
+    ) -> ANNResult<Self> {
         let mut disk_vertex_provider_factory = DiskVertexProviderFactory {
             aligned_reader_factory,
             caching_strategy,
             cache: None,
+            physical_layout,
+            physical_layout_load_time_us,
         };
 
         if disk_vertex_provider_factory.caching_strategy != CachingStrategy::None {
@@ -135,12 +159,27 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         Ok(disk_vertex_provider_factory)
     }
 
+    pub fn physical_layout_memory_bytes(&self) -> usize {
+        self.physical_layout
+            .as_ref()
+            .map_or(0, |layout| layout.memory_bytes())
+    }
+
+    pub fn physical_layout_load_time_us(&self) -> u128 {
+        self.physical_layout_load_time_us
+    }
+
     fn create_disk_vertex_provider(
         &self,
         max_batch_size: usize,
         header: &GraphHeader,
     ) -> ANNResult<DiskVertexProvider<Data, ReaderFactory::AlignedReaderType>> {
-        DiskVertexProvider::new(header, max_batch_size, self.aligned_reader_factory.build()?)
+        DiskVertexProvider::new_with_layout(
+            header,
+            max_batch_size,
+            self.aligned_reader_factory.build()?,
+            self.physical_layout.clone(),
+        )
     }
 
     fn setup_cache(&mut self) -> ANNResult<()> {
@@ -497,6 +536,8 @@ pub(crate) mod tests {
             ),
             caching_strategy: CachingStrategy::StaticCacheWithBfsNodes(10),
             cache: None, // Intentionally None despite caching strategy requiring it
+            physical_layout: None,
+            physical_layout_load_time_us: 0,
         };
 
         let header = factory.get_header().unwrap();

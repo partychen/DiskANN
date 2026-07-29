@@ -56,6 +56,8 @@ pub(super) struct DiskSearchStats {
     pub(crate) distance: SimilarityMeasure,
     pub(crate) uses_vector_filters: bool,
     pub(super) num_nodes_to_cache: Option<usize>,
+    pub(super) physical_layout_mapping_bytes: usize,
+    pub(super) physical_layout_load_time_us: u128,
     pub(super) search_results_per_l: Vec<DiskSearchResult>,
     span_metrics: serde_json::Value,
 }
@@ -68,6 +70,8 @@ pub(super) struct DiskSearchResult {
     pub(super) p95_latency: MicroSeconds,
     pub(super) p999_latency: MicroSeconds,
     pub(super) mean_ios: f64,
+    pub(super) mean_physical_blocks_read: f64,
+    pub(super) mean_physical_bytes_read: f64,
     pub(super) mean_traversal_uncached_reads: f64,
     pub(super) mean_rerank_uncached_reads: f64,
     pub(super) mean_io_time: f64,
@@ -156,6 +160,12 @@ impl DiskSearchResult {
                 |s| s.total_execution_time_us,
             ) as u64),
             mean_ios: statistics::get_mean_stats(statistics, |s| s.total_io_operations),
+            mean_physical_blocks_read: statistics::get_mean_stats(statistics, |s| {
+                s.physical_blocks_read as f64
+            }),
+            mean_physical_bytes_read: statistics::get_mean_stats(statistics, |s| {
+                s.physical_bytes_read as f64
+            }),
             mean_traversal_uncached_reads: statistics::get_mean_stats(statistics, |s| {
                 s.traversal_uncached_reads
             }),
@@ -342,6 +352,8 @@ where
     };
     let mut vertex_provider_factory =
         DiskVertexProviderFactory::from_disk_index_path(disk_index_path, caching_strategy)?;
+    let physical_layout_mapping_bytes = vertex_provider_factory.physical_layout_memory_bytes();
+    let physical_layout_load_time_us = vertex_provider_factory.physical_layout_load_time_us();
 
     if let Some(nodes) = &frequency_cache_nodes {
         let cache_budget = search_params
@@ -496,6 +508,8 @@ where
         distance: search_params.distance,
         uses_vector_filters: search_params.vector_filters_file.is_some(),
         num_nodes_to_cache: search_params.num_nodes_to_cache,
+        physical_layout_mapping_bytes,
+        physical_layout_load_time_us,
         search_results_per_l,
         span_metrics,
     })
@@ -544,7 +558,7 @@ impl fmt::Display for DiskSearchStats {
         let fmt_us = |v: f64| -> String { format!("{:.1}us", v) };
         let fmt_pct = |v: f64| -> String { format!("{:.1}%", v) };
 
-        let cols: [(&str, usize); 19] = [
+        let cols: [(&str, usize); 21] = [
             ("L", 2),
             ("KNN", 3),
             ("QPS", 8),
@@ -552,6 +566,8 @@ impl fmt::Display for DiskSearchStats {
             ("95% Latency", 13),
             ("99.9 Latency", 13),
             ("IOs", 6),
+            ("Blocks", 8),
+            ("Bytes", 12),
             ("Traversal IO", 12),
             ("Rerank IO", 9),
             ("IO (us)", 10),
@@ -591,6 +607,11 @@ impl fmt::Display for DiskSearchStats {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "None".to_string())
         )?;
+        writeln!(
+            f,
+            "Layout mapping,  : {} bytes (loaded in {}us)",
+            self.physical_layout_mapping_bytes, self.physical_layout_load_time_us
+        )?;
 
         // Table
         writeln!(f, "{rule}")?;
@@ -599,7 +620,7 @@ impl fmt::Display for DiskSearchStats {
 
         for r in &self.search_results_per_l {
             // Prepare values as strings with numeric formatting
-            let vals: [String; 19] = [
+            let vals: [String; 21] = [
                 format!("{}", r.search_l),
                 format!("{}", self.recall_at),
                 format!("{:.1}", r.qps),
@@ -607,6 +628,8 @@ impl fmt::Display for DiskSearchStats {
                 format!("{}", r.p95_latency),
                 format!("{}", r.p999_latency),
                 format!("{:.1}", r.mean_ios),
+                format!("{:.1}", r.mean_physical_blocks_read),
+                format!("{:.1}", r.mean_physical_bytes_read),
                 format!("{:.1}", r.mean_traversal_uncached_reads),
                 format!("{:.1}", r.mean_rerank_uncached_reads),
                 fmt_us(r.mean_io_time),

@@ -265,6 +265,10 @@ struct IOTracker {
     routing_time_us: AtomicU64,
     // Physical disk reads (uncached vertex fetches). Cached hits do not count.
     io_count: AtomicUsize,
+    // Unique physical graph blocks spanned by those reads.
+    physical_blocks_read: AtomicU64,
+    // Physical graph-index bytes read.
+    physical_bytes_read: AtomicU64,
     // Logical vertices visited/loaded (including cache hits).
     vertices_loaded: AtomicUsize,
     // Graph-frontier nodes considered for expansion before the IO-limit gate.
@@ -284,6 +288,8 @@ impl Default for IOTracker {
             preprocess_time_us: AtomicU64::new(0),
             routing_time_us: AtomicU64::new(0),
             io_count: AtomicUsize::new(0),
+            physical_blocks_read: AtomicU64::new(0),
+            physical_bytes_read: AtomicU64::new(0),
             vertices_loaded: AtomicUsize::new(0),
             frontier_nodes_requested: AtomicUsize::new(0),
             frontier_cache_hits: AtomicUsize::new(0),
@@ -309,6 +315,26 @@ impl IOTracker {
 
     fn io_count(&self) -> usize {
         self.io_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn add_physical_blocks_read(&self, count: u64) {
+        self.physical_blocks_read
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn physical_blocks_read(&self) -> u64 {
+        self.physical_blocks_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn add_physical_bytes_read(&self, count: u64) {
+        self.physical_bytes_read
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn physical_bytes_read(&self) -> u64 {
+        self.physical_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn add_vertices_loaded(&self, count: usize) {
@@ -920,11 +946,21 @@ where
         let timer = Instant::now();
         // Snapshot physical reads before/after so cache hits are excluded from the IO count.
         let physical_before = scratch.vertex_provider.io_operations();
+        let blocks_before = scratch.vertex_provider.physical_blocks_read();
+        let bytes_before = scratch.vertex_provider.physical_bytes_read();
         ensure_vertex_loaded(&mut scratch.vertex_provider, ids)?;
         let physical_read = scratch
             .vertex_provider
             .io_operations()
             .saturating_sub(physical_before) as usize;
+        let physical_blocks = scratch
+            .vertex_provider
+            .physical_blocks_read()
+            .saturating_sub(blocks_before);
+        let physical_bytes = scratch
+            .vertex_provider
+            .physical_bytes_read()
+            .saturating_sub(bytes_before);
         IOTracker::add_time(
             &self.io_tracker.io_time_us,
             timer.elapsed().as_micros() as u64,
@@ -932,6 +968,8 @@ where
         // `io_count` tracks physical disk reads (uncached); `vertices_loaded` tracks all
         // vertices visited (including cache hits).
         self.io_tracker.add_io_count(physical_read);
+        self.io_tracker.add_physical_blocks_read(physical_blocks);
+        self.io_tracker.add_physical_bytes_read(physical_bytes);
         self.io_tracker.add_phase_io_count(phase, physical_read);
         self.io_tracker.add_vertices_loaded(ids.len());
         for id in ids {
@@ -1519,6 +1557,8 @@ where
         query_stats.total_execution_time_us = timer.elapsed().as_micros();
         query_stats.io_time_us = IOTracker::time(&io_tracker.io_time_us) as u128;
         query_stats.total_io_operations = io_tracker.io_count() as u32;
+        query_stats.physical_blocks_read = io_tracker.physical_blocks_read();
+        query_stats.physical_bytes_read = io_tracker.physical_bytes_read();
         query_stats.total_vertices_loaded = io_tracker.vertices_loaded() as u32;
         query_stats.frontier_nodes_requested = io_tracker.frontier_nodes_requested() as u32;
         query_stats.frontier_cache_hits = io_tracker.frontier_cache_hits() as u32;
@@ -1570,7 +1610,7 @@ mod disk_provider_tests {
         ANNErrorKind,
     };
     use diskann_providers::storage::{
-        DynWriteProvider, StorageReadProvider, VirtualStorageProvider,
+        DynWriteProvider, FileStorageProvider, StorageReadProvider, VirtualStorageProvider,
     };
     use diskann_providers::utils::{create_thread_pool, PQPathNames, ParallelIteratorInPool};
     use diskann_utils::{io::read_bin, test_data_root};
@@ -1582,9 +1622,13 @@ mod disk_provider_tests {
     use super::*;
     use crate::{
         build::builder::core::disk_index_builder_tests::{IndexBuildFixture, TestParams},
-        search::provider::aligned_file_reader::VirtualAlignedReaderFactory,
+        layout::rewrite_graph_aware_layout,
+        search::provider::aligned_file_reader::{
+            AlignedFileReaderFactory, VirtualAlignedReaderFactory,
+        },
         utils::QueryStatistics,
     };
+    use tempfile::tempdir;
 
     const TEST_INDEX_PREFIX_128DIM: &str =
         "/disk_index_search/disk_index_sift_learn_R4_L50_A1.2_truth_search";
@@ -1694,6 +1738,78 @@ mod disk_provider_tests {
             k: 10,
             l: 20,
         });
+    }
+
+    #[test]
+    fn graph_aware_layout_preserves_exact_search_results_and_cache_ids() {
+        let root = test_data_root();
+        let relative = |path: &str| root.join(path.trim_start_matches('/'));
+        let source_index = relative(TEST_INDEX_128DIM);
+        let directory = tempdir().unwrap();
+        let mapped_index = directory.path().join("graph-aware.index");
+        rewrite_graph_aware_layout(&source_index, &mapped_index).unwrap();
+
+        let storage = FileStorageProvider;
+        let reader = DiskIndexReader::new(
+            relative(TEST_PQ_PIVOT_128DIM)
+                .to_string_lossy()
+                .into_owned(),
+            relative(TEST_PQ_COMPRESSED_128DIM)
+                .to_string_lossy()
+                .into_owned(),
+            &storage,
+        )
+        .unwrap();
+        let legacy_factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            AlignedFileReaderFactory,
+        >::from_disk_index_path(
+            source_index.to_string_lossy().into_owned(),
+            CachingStrategy::None,
+        )
+        .unwrap();
+        let mapped_factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            AlignedFileReaderFactory,
+        >::from_disk_index_path(
+            mapped_index.to_string_lossy().into_owned(),
+            CachingStrategy::StaticCacheWithBfsNodes(32),
+        )
+        .unwrap();
+        assert!(mapped_factory.physical_layout_memory_bytes() > 0);
+
+        let legacy =
+            DiskIndexSearcher::new(1, usize::MAX, &reader, legacy_factory, Metric::L2, None)
+                .unwrap();
+        let mapped =
+            DiskIndexSearcher::new(1, usize::MAX, &reader, mapped_factory, Metric::L2, None)
+                .unwrap();
+        let queries = read_bin::<f32>(
+            &mut storage
+                .open_reader(relative(TEST_QUERY_10PTS_128DIM).to_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        for query in queries.row_iter() {
+            let legacy_result = legacy
+                .search(query, 10, 20, Some(4), SearchMode::graph())
+                .unwrap();
+            let mapped_result = mapped
+                .search(query, 10, 20, Some(4), SearchMode::graph())
+                .unwrap();
+            let legacy_items = legacy_result
+                .results
+                .iter()
+                .map(|item| (item.vertex_id, item.distance.to_bits()))
+                .collect::<Vec<_>>();
+            let mapped_items = mapped_result
+                .results
+                .iter()
+                .map(|item| (item.vertex_id, item.distance.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(legacy_items, mapped_items);
+        }
     }
 
     fn get_truth_associated_data<StorageReader: StorageReadProvider>(

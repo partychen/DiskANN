@@ -7,7 +7,7 @@ mod graph_layout_version;
 pub use graph_layout_version::GraphLayoutVersion;
 
 mod graph_metadata;
-pub use graph_metadata::GraphMetadata;
+pub use graph_metadata::{GraphMetadata, LayoutFingerprint};
 
 mod graph_header;
 pub use graph_header::GraphHeader;

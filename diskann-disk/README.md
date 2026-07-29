@@ -81,6 +81,39 @@ To cluster Search-PQ reconstructed vectors instead of the original data, pass
 `--pq-pivots-file`, `--pq-compressed-file`, and `--distance l2` or
 `--distance innerproduct`.
 
+#### Graph-aware physical layout
+
+The `graph_aware_layout` tool rewrites an existing disk graph without rebuilding Vamana or
+Search-PQ. Graph adjacency lists and every externally visible node ID remain logical IDs. Layout
+1.1 stores only node records in a different physical order and uses a checksummed
+`<output-index>.layout` sidecar for logical-to-physical translation.
+
+Estimate space and memory without creating index outputs:
+
+```bash
+cargo run --release -p diskann-tools --bin graph_aware_layout -- \
+  --source-index /path/to/source_disk.index \
+  --output-index /path/to/graph_aware_disk.index \
+  --report /path/to/layout_estimate.json \
+  --estimate-only
+```
+
+Remove `--estimate-only` and choose a new report path to perform the rewrite. The tool refuses to
+overwrite the output index, sidecar, or report. The output has the same graph geometry and file size
+as the source, so existing Search-PQ and routing sidecars remain valid under their original logical
+IDs.
+
+Packing is deterministic and uses no random seed. Each block starts with the lowest unassigned
+logical ID. Remaining slots greedily select the unassigned node with the most outgoing edges from
+nodes already in that block, breaking ties by lowest logical ID. Packed blocks are ordered from the
+medoid block by greatest outgoing edge weight to an unplaced adjacent block, again breaking ties by
+lowest original block ID; disconnected restarts use the lowest unplaced block.
+
+Search loads the mapping only for layout 1.1. It deduplicates requested physical blocks and
+coalesces adjacent blocks into range reads. `total_io_operations` counts read requests, while
+`physical_blocks_read` and `physical_bytes_read` account for the full ranges. Legacy layouts retain
+their direct logical-ID offset calculation and per-vertex read behavior.
+
 ### Data Model Module
 
 - Graph headers, metadata, layout versioning, and caching structures

@@ -3,7 +3,7 @@
  * Licensed under the MIT license.
  */
 
-use std::ptr;
+use std::{ptr, sync::Arc};
 
 use crate::data_model::GraphDataType;
 use byteorder::{ByteOrder, LittleEndian};
@@ -12,6 +12,7 @@ use hashbrown::HashMap;
 
 use crate::{
     data_model::GraphHeader,
+    layout::PhysicalLayout,
     search::{
         provider::{
             aligned_file_reader::traits::AlignedFileReader, disk_sector_graph::DiskSectorGraph,
@@ -64,6 +65,12 @@ where
     // No of IO operations performed via this provider.
     io_operations: u32,
 
+    physical_blocks_read: u64,
+
+    physical_bytes_read: u64,
+
+    vertices_loaded_count: u32,
+
     // Max nodes that can be loaded in a single batch.
     max_batch_size: usize,
 }
@@ -115,8 +122,23 @@ where
 
     fn load_vertices(&mut self, vertex_ids: &[Data::VectorIdType]) -> ANNResult<()> {
         self.clear_before_next_read();
-        self.fetch_nodes(vertex_ids)?;
-        self.io_operations += vertex_ids.len() as u32;
+        let metrics = self.fetch_nodes(vertex_ids)?;
+        self.io_operations = self
+            .io_operations
+            .checked_add(metrics.read_requests)
+            .ok_or_else(|| ANNError::log_index_error("physical read request counter overflow"))?;
+        self.physical_blocks_read = self
+            .physical_blocks_read
+            .checked_add(metrics.blocks_read)
+            .ok_or_else(|| ANNError::log_index_error("physical block counter overflow"))?;
+        self.physical_bytes_read = self
+            .physical_bytes_read
+            .checked_add(metrics.bytes_read)
+            .ok_or_else(|| ANNError::log_index_error("physical byte counter overflow"))?;
+        self.vertices_loaded_count = self
+            .vertices_loaded_count
+            .checked_add(vertex_ids.len().try_into()?)
+            .ok_or_else(|| ANNError::log_index_error("loaded vertex counter overflow"))?;
         Ok(())
     }
 
@@ -125,8 +147,8 @@ where
         vertex_id: &Data::VectorIdType,
         idx: usize,
     ) -> Result<(), ANNError> {
-        let fp_vector_buf =
-            &self.sector_graph.node_disk_buf(idx, *vertex_id)[..self.fp_vector_len as usize];
+        let node_disk_buf = self.sector_graph.node_disk_buf(idx, *vertex_id)?;
+        let fp_vector_buf = &node_disk_buf[..self.fp_vector_len as usize];
 
         // memcpy from fp_vector_buf to the vector buffer.
         // The safe condition is met here since the dimension of the vector in fp_vector_buffer is
@@ -140,8 +162,7 @@ where
                 fp_vector_buf.len(),
             );
         }
-        let neighbor_and_data_buf =
-            &self.sector_graph.node_disk_buf(idx, *vertex_id)[self.fp_vector_len as usize..];
+        let neighbor_and_data_buf = &node_disk_buf[self.fp_vector_len as usize..];
         let num_neighbors = LittleEndian::read_u32(&neighbor_and_data_buf[0..4]) as usize;
         match neighbor_and_data_buf.get(4..4 + num_neighbors * 4) {
             Some(buf) => {
@@ -190,13 +211,24 @@ where
         self.io_operations
     }
 
+    fn physical_blocks_read(&self) -> u64 {
+        self.physical_blocks_read
+    }
+
+    fn physical_bytes_read(&self) -> u64 {
+        self.physical_bytes_read
+    }
+
     fn clear(&mut self) {
         self.clear_before_next_read();
         self.io_operations = 0;
+        self.physical_blocks_read = 0;
+        self.physical_bytes_read = 0;
+        self.vertices_loaded_count = 0;
     }
 
     fn vertices_loaded_count(&self) -> u32 {
-        self.io_operations
+        self.vertices_loaded_count
     }
 }
 
@@ -211,13 +243,27 @@ where
         max_batch_size: usize,
         sector_reader: AlignedReaderType,
     ) -> ANNResult<Self> {
+        Self::new_with_layout(header, max_batch_size, sector_reader, None)
+    }
+
+    pub(crate) fn new_with_layout(
+        header: &GraphHeader,
+        max_batch_size: usize,
+        sector_reader: AlignedReaderType,
+        physical_layout: Option<Arc<PhysicalLayout>>,
+    ) -> ANNResult<Self> {
         let metadata = header.metadata();
         let dim = metadata.dims;
         Ok(Self {
             centroid_vertex_id: metadata.medoid,
             dim,
             fp_vector_len: (dim * std::mem::size_of::<Data::VectorDataType>()) as u64,
-            sector_graph: DiskSectorGraph::new(sector_reader, header, max_batch_size)?,
+            sector_graph: DiskSectorGraph::new_with_layout(
+                sector_reader,
+                header,
+                max_batch_size,
+                physical_layout,
+            )?,
 
             vector_buf: vec![Data::VectorDataType::default(); max_batch_size * dim],
             cached_adjacency_list: Vec::with_capacity(max_batch_size),
@@ -226,6 +272,9 @@ where
             associated_data_size: metadata.associated_data_length,
             node_len: metadata.node_len,
             io_operations: 0,
+            physical_blocks_read: 0,
+            physical_bytes_read: 0,
+            vertices_loaded_count: 0,
             max_batch_size,
         })
     }
@@ -244,16 +293,12 @@ where
     }
 
     /// Fetch nodes from disk index
-    fn fetch_nodes(&mut self, nodes_to_fetch: &[Data::VectorIdType]) -> ANNResult<()> {
+    fn fetch_nodes(
+        &mut self,
+        nodes_to_fetch: &[Data::VectorIdType],
+    ) -> ANNResult<super::disk_sector_graph::PhysicalReadMetrics> {
         self.reconfigure(nodes_to_fetch.len())?;
-        let sectors_to_fetch: Vec<u64> = nodes_to_fetch
-            .iter()
-            .map(|&vertex_id| self.sector_graph.node_sector_index(vertex_id))
-            .collect();
-
-        self.sector_graph.read_graph(&sectors_to_fetch)?;
-
-        Ok(())
+        self.sector_graph.read_vertices(nodes_to_fetch)
     }
 
     /// Reset graph

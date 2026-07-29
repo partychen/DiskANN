@@ -41,6 +41,8 @@ impl From<GraphHeaderError> for ANNError {
 impl GraphHeader {
     /// Update the layout version when the [GraphHeader] layout is modified.
     pub const CURRENT_LAYOUT_VERSION: GraphLayoutVersion = GraphLayoutVersion::new(1, 0);
+    /// Layout version using a logical-to-physical sidecar.
+    pub const GRAPH_AWARE_LAYOUT_VERSION: GraphLayoutVersion = GraphLayoutVersion::new(1, 1);
 
     pub fn new(
         metadata: GraphMetadata,
@@ -90,7 +92,11 @@ impl GraphHeader {
     /// # Type Parameters
     /// * `DataType` - The type of vector data stored in the graph nodes
     pub fn max_degree<DataType>(&self) -> Result<usize, GraphHeaderError> {
-        let supported_versions = [GraphLayoutVersion::new(0, 0), GraphLayoutVersion::new(1, 0)];
+        let supported_versions = [
+            GraphLayoutVersion::new(0, 0),
+            GraphLayoutVersion::new(1, 0),
+            Self::GRAPH_AWARE_LAYOUT_VERSION,
+        ];
 
         if supported_versions.contains(&self.layout_version) {
             // Calculates max degree based on the node layout:
@@ -225,6 +231,7 @@ mod tests {
     #[case(384, 1008, 0, 59, GraphLayoutVersion::new(1, 0))]
     #[case(3072, 6384, 0, 59, GraphLayoutVersion::new(0, 0))]
     #[case(3072, 6384, 0, 59, GraphLayoutVersion::new(1, 0))]
+    #[case(384, 1008, 0, 59, GraphLayoutVersion::new(1, 1))]
     // Current layout version should support max degree calculation
     #[case(384, 1008, 0, 59, GraphHeader::CURRENT_LAYOUT_VERSION)]
     fn test_graph_header_max_degree(
@@ -262,7 +269,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(1, 1)]
+    #[case(1, 2)]
     #[case(2, 0)]
     fn test_graph_header_max_degree_unsupported_layout_version(
         #[case] major_version: u32,

@@ -17,6 +17,7 @@ pub use build::{
 };
 
 pub mod data_model;
+pub mod layout;
 pub mod routing;
 pub mod search;
 pub mod storage;

@@ -95,6 +95,16 @@ pub trait VertexProvider<Data: GraphDataType>: Send + Sync {
     /// Returns the number of IO operations performed by the vertex provider.
     fn io_operations(&self) -> u32;
 
+    /// Returns the number of physical disk blocks spanned by those IO operations.
+    fn physical_blocks_read(&self) -> u64 {
+        u64::from(self.io_operations())
+    }
+
+    /// Returns the number of physical bytes read from the graph index.
+    fn physical_bytes_read(&self) -> u64 {
+        0
+    }
+
     /// Returns whether a vertex can be served without physical IO.
     fn is_cached(&self, _vertex_id: &Data::VectorIdType) -> bool {
         false

@@ -12,6 +12,7 @@ use hashbrown::HashMap;
 
 use crate::{
     data_model::{Cache, GraphHeader},
+    layout::PhysicalLayout,
     search::{
         provider::{
             aligned_file_reader::traits::AlignedFileReader,
@@ -105,6 +106,14 @@ where
         self.vector_provider.io_operations()
     }
 
+    fn physical_blocks_read(&self) -> u64 {
+        self.vector_provider.physical_blocks_read()
+    }
+
+    fn physical_bytes_read(&self) -> u64 {
+        self.vector_provider.physical_bytes_read()
+    }
+
     fn is_cached(&self, vertex_id: &Data::VectorIdType) -> bool {
         self.cache.contains(vertex_id)
     }
@@ -132,7 +141,22 @@ where
         sector_reader: AlignedReaderType,
         cache: Arc<Cache<Data>>,
     ) -> ANNResult<Self> {
-        let vector_provider = DiskVertexProvider::new(header, max_batch_size, sector_reader)?;
+        Self::new_with_layout(header, max_batch_size, sector_reader, cache, None)
+    }
+
+    pub(crate) fn new_with_layout(
+        header: &GraphHeader,
+        max_batch_size: usize,
+        sector_reader: AlignedReaderType,
+        cache: Arc<Cache<Data>>,
+        physical_layout: Option<Arc<PhysicalLayout>>,
+    ) -> ANNResult<Self> {
+        let vector_provider = DiskVertexProvider::new_with_layout(
+            header,
+            max_batch_size,
+            sector_reader,
+            physical_layout,
+        )?;
         Ok(CachedDiskVertexProvider {
             cache,
             vector_provider,
