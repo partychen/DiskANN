@@ -170,6 +170,17 @@ pub(crate) struct DiskSearchPhase {
     pub(crate) num_nodes_to_cache: Option<usize>,
     pub(crate) search_io_limit: Option<usize>,
     pub(crate) post_processor: Option<TopkPostProcessor>,
+    /// Optional query-aware routing table sidecar. When present, disk search selects
+    /// `routing_entry_count` query-nearest graph entry points instead of the medoid.
+    #[serde(default)]
+    pub(crate) routing_table: Option<InputFile>,
+    /// Number of routing entry points to use when `routing_table` is set. Defaults to 1.
+    #[serde(default)]
+    pub(crate) routing_entry_count: Option<NonZeroUsize>,
+    /// Optional representative queries used to build an exact Top-K cache from
+    /// graph-frontier visit frequency before the measured search begins.
+    #[serde(default)]
+    pub(crate) cache_sample_queries: Option<InputFile>,
 }
 
 /////////
@@ -273,6 +284,14 @@ impl DiskSearchPhase {
         if let Some(vf) = self.vector_filters_file.as_mut() {
             vf.resolve(checker).context("invalid vector_filters_file")?;
         }
+        if let Some(rt) = self.routing_table.as_mut() {
+            rt.resolve(checker).context("invalid routing_table")?;
+        }
+        if let Some(sample_queries) = self.cache_sample_queries.as_mut() {
+            sample_queries
+                .resolve(checker)
+                .context("invalid cache_sample_queries")?;
+        }
 
         #[cfg(feature = "disk-index")]
         if let Some(is_flat_search) = self.is_flat_search {
@@ -308,6 +327,18 @@ impl DiskSearchPhase {
             if n == 0 {
                 anyhow::bail!("num_nodes_to_cache must be positive if specified");
             }
+        }
+        if self.cache_sample_queries.is_some() && self.num_nodes_to_cache.is_none() {
+            anyhow::bail!("num_nodes_to_cache is required when cache_sample_queries is specified");
+        }
+        #[cfg(feature = "disk-index")]
+        if self.cache_sample_queries.is_some()
+            && (self.search_mode.is_flat_search
+                || self.search_mode.adaptive_l.is_some()
+                || self.vector_filters_file.is_some()
+                || self.post_processor.is_some())
+        {
+            anyhow::bail!("cache_sample_queries currently supports unfiltered graph search only");
         }
         if let Some(lim) = self.search_io_limit {
             if lim == 0 {
@@ -367,6 +398,9 @@ impl Example for DiskIndexOperation {
             num_nodes_to_cache: None,
             search_io_limit: None,
             post_processor: None,
+            routing_table: None,
+            routing_entry_count: None,
+            cache_sample_queries: None,
         };
 
         Self {
@@ -498,6 +532,23 @@ impl DiskSearchPhase {
         match &self.post_processor {
             Some(pp) => write_field!(f, "Post Processor", pp)?,
             None => write_field!(f, "Post Processor", "none")?,
+        }
+        match &self.routing_table {
+            Some(rt) => {
+                write_field!(f, "Routing Table", rt.display())?;
+                write_field!(
+                    f,
+                    "Routing Entries",
+                    self.routing_entry_count
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "1".to_string())
+                )?
+            }
+            None => write_field!(f, "Routing Table", "none (medoid start point)")?,
+        }
+        match &self.cache_sample_queries {
+            Some(queries) => write_field!(f, "Cache Sample Queries", queries.display())?,
+            None => write_field!(f, "Cache Sample Queries", "none (BFS cache)")?,
         }
         Ok(())
     }

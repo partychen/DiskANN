@@ -4,7 +4,13 @@
  */
 
 use rayon::prelude::*;
-use std::{collections::HashSet, fmt, sync::atomic::AtomicBool, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    num::NonZeroUsize,
+    sync::atomic::AtomicBool,
+    time::Instant,
+};
 
 use opentelemetry::{global, trace::Span, trace::Tracer};
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -13,6 +19,7 @@ use diskann::utils::VectorRepr;
 use diskann_benchmark_runner::{files::InputFile, utils::MicroSeconds};
 use diskann_disk::{
     data_model::{AdHoc, CachingStrategy},
+    routing::RoutingTable,
     search::{
         provider::{
             disk_provider::DiskIndexSearcher,
@@ -61,11 +68,16 @@ pub(super) struct DiskSearchResult {
     pub(super) p95_latency: MicroSeconds,
     pub(super) p999_latency: MicroSeconds,
     pub(super) mean_ios: f64,
+    pub(super) mean_traversal_uncached_reads: f64,
+    pub(super) mean_rerank_uncached_reads: f64,
     pub(super) mean_io_time: f64,
     pub(super) mean_cpu_time: f64,
     pub(super) mean_pq_preprocess_time: f64,
+    pub(super) mean_routing_time: f64,
     pub(super) mean_comparisons: f64,
     pub(super) mean_hops: f64,
+    pub(super) mean_frontier_nodes_requested: f64,
+    pub(super) mean_frontier_cache_hits: f64,
     pub(super) cache_hit_percentage: f64,
     pub(super) recall: f32,
 }
@@ -80,13 +92,14 @@ impl DiskSearchResult {
         num_queries: usize,
         gt_context: &GroundTruthContext,
     ) -> anyhow::Result<DiskSearchResult> {
-        let total_ios = statistics::get_sum_stats(statistics, |stats| stats.total_io_operations);
-        let total_vertices_loaded =
-            statistics::get_sum_stats(statistics, |stats| stats.total_vertices_loaded);
-        let cache_hit_percentage = if total_vertices_loaded > 0.0 {
-            100.0 * (1.0 - (total_ios / total_vertices_loaded))
+        let total_frontier_nodes =
+            statistics::get_sum_stats(statistics, |stats| stats.frontier_nodes_requested);
+        let total_frontier_cache_hits =
+            statistics::get_sum_stats(statistics, |stats| stats.frontier_cache_hits);
+        let cache_hit_percentage = if total_frontier_nodes > 0.0 {
+            100.0 * total_frontier_cache_hits / total_frontier_nodes
         } else {
-            100.0
+            0.0
         };
 
         let recall = if let Some(var_gt) = &gt_context.gt_ids_variable_length {
@@ -143,15 +156,30 @@ impl DiskSearchResult {
                 |s| s.total_execution_time_us,
             ) as u64),
             mean_ios: statistics::get_mean_stats(statistics, |s| s.total_io_operations),
+            mean_traversal_uncached_reads: statistics::get_mean_stats(statistics, |s| {
+                s.traversal_uncached_reads
+            }),
+            mean_rerank_uncached_reads: statistics::get_mean_stats(statistics, |s| {
+                s.rerank_uncached_reads
+            }),
             mean_io_time: statistics::get_mean_stats(statistics, |s| s.io_time_us as f64),
             mean_cpu_time: statistics::get_mean_stats(statistics, |stats| stats.cpu_time_us as f64),
             mean_pq_preprocess_time: statistics::get_mean_stats(statistics, |stats| {
                 stats.query_pq_preprocess_time_us as f64
             }),
+            mean_routing_time: statistics::get_mean_stats(statistics, |stats| {
+                stats.routing_time_us as f64
+            }),
             mean_comparisons: statistics::get_mean_stats(statistics, |stats| {
                 stats.total_comparisons as f64
             }),
             mean_hops: statistics::get_mean_stats(statistics, |s| s.search_hops as f64),
+            mean_frontier_nodes_requested: statistics::get_mean_stats(statistics, |s| {
+                s.frontier_nodes_requested
+            }),
+            mean_frontier_cache_hits: statistics::get_mean_stats(statistics, |s| {
+                s.frontier_cache_hits
+            }),
             cache_hit_percentage,
             recall,
         })
@@ -212,16 +240,126 @@ where
 
     let index_reader = DiskIndexReader::new(pivot_path, pq_data_path, &FileStorageProvider)?;
 
-    let caching_strategy = if let Some(num_nodes) = search_params.num_nodes_to_cache {
-        CachingStrategy::StaticCacheWithBfsNodes(num_nodes)
-    } else {
-        CachingStrategy::None
+    let routing_present = search_params.routing_table.is_some();
+    let pool = create_thread_pool(search_params.num_threads)?;
+
+    // Preload routing so cache training and measured search use identical entry selection.
+    let routing = match &search_params.routing_table {
+        Some(routing_table) => {
+            let routing_path = routing_table.to_string_lossy();
+            let entry_count = search_params
+                .routing_entry_count
+                .unwrap_or(NonZeroUsize::MIN);
+            let table = RoutingTable::load(&routing_path, storage_provider)?;
+            Some((table, entry_count))
+        }
+        None => None,
     };
 
-    let vertex_provider_factory =
+    let frequency_cache_nodes = match &search_params.cache_sample_queries {
+        Some(sample_query_file) => {
+            let sample_queries: Matrix<T> =
+                datafiles::load_dataset(datafiles::BinFile(sample_query_file))?;
+            let cache_budget = search_params
+                .num_nodes_to_cache
+                .expect("validated cache_sample_queries must have a cache budget");
+            let training_l = *search_params
+                .search_list
+                .iter()
+                .max()
+                .expect("validated search_list must be non-empty");
+
+            let training_factory = DiskVertexProviderFactory::from_disk_index_path(
+                disk_index_path.clone(),
+                CachingStrategy::None,
+            )?;
+            let mut training_searcher = DiskIndexSearcher::<AdHoc<T>, _>::new(
+                search_params.num_threads,
+                search_params.search_io_limit.unwrap_or(usize::MAX),
+                &index_reader,
+                training_factory,
+                search_params.distance.into(),
+                None,
+            )?;
+            if let Some((table, entry_count)) = &routing {
+                training_searcher.set_routing_table(table.clone(), *entry_count)?;
+            }
+            let training_searcher = &training_searcher;
+
+            let visited_per_query = sample_queries
+                .par_row_iter()
+                .map(|query| {
+                    training_searcher
+                        .search_with_visited_nodes(
+                            query,
+                            search_params.recall_at,
+                            training_l,
+                            Some(search_params.beam_width),
+                            SearchMode::graph(),
+                        )
+                        .map(|(_, visited)| visited)
+                })
+                .collect_in_pool::<Result<Vec<_>, _>>(pool.as_ref())?;
+
+            let mut visit_counts = HashMap::<u32, u32>::new();
+            for visited in visited_per_query {
+                for node in visited {
+                    *visit_counts.entry(node).or_default() += 1;
+                }
+            }
+            let unique_visited = visit_counts.len();
+            if unique_visited < cache_budget {
+                anyhow::bail!(
+                    "cache sample queries visited only {unique_visited} unique nodes, fewer than \
+                     the requested cache budget {cache_budget}"
+                );
+            }
+
+            let mut ranked_nodes = visit_counts.into_iter().collect::<Vec<_>>();
+            ranked_nodes.sort_unstable_by(|(left_id, left_count), (right_id, right_count)| {
+                right_count
+                    .cmp(left_count)
+                    .then_with(|| left_id.cmp(right_id))
+            });
+            ranked_nodes.truncate(cache_budget);
+            Some(
+                ranked_nodes
+                    .into_iter()
+                    .map(|(node, _)| node)
+                    .collect::<Vec<_>>(),
+            )
+        }
+        None => None,
+    };
+
+    // Default medoid BFS is constructed by the factory. Routing BFS and exact
+    // frequency caches are installed after construction.
+    let caching_strategy = match search_params.num_nodes_to_cache {
+        Some(num_nodes) if !routing_present && frequency_cache_nodes.is_none() => {
+            CachingStrategy::StaticCacheWithBfsNodes(num_nodes)
+        }
+        _ => CachingStrategy::None,
+    };
+    let mut vertex_provider_factory =
         DiskVertexProviderFactory::from_disk_index_path(disk_index_path, caching_strategy)?;
 
-    let searcher = &DiskIndexSearcher::<AdHoc<T>, _>::new(
+    if let Some(nodes) = &frequency_cache_nodes {
+        let cache_budget = search_params
+            .num_nodes_to_cache
+            .expect("validated frequency cache must have a cache budget");
+        let cached = vertex_provider_factory.seed_cache_from_exact_nodes(nodes, cache_budget)?;
+        if cached != cache_budget {
+            anyhow::bail!(
+                "frequency cache loaded {cached} nodes, expected the full budget {cache_budget}"
+            );
+        }
+    } else if let (Some((table, _)), Some(cache_budget)) =
+        (&routing, search_params.num_nodes_to_cache)
+    {
+        vertex_provider_factory.seed_cache_from_nodes(table.ids(), cache_budget)?;
+    }
+
+    let searcher = &mut DiskIndexSearcher::<AdHoc<T>, _>::new(
         search_params.num_threads,
         if let Some(lim) = search_params.search_io_limit {
             lim
@@ -234,9 +372,14 @@ where
         None,
     )?;
 
+    // Enable multi/query-aware routing entry points when a routing sidecar is supplied.
+    if let Some((table, entry_count)) = routing {
+        searcher.set_routing_table(table, entry_count)?;
+    }
+    let searcher = &*searcher;
+
     logger.log_checkpoint("index_loaded");
 
-    let pool = create_thread_pool(search_params.num_threads)?;
     let mut search_results_per_l = Vec::with_capacity(search_params.search_list.len());
     let has_any_search_failed = AtomicBool::new(false);
 
@@ -401,7 +544,7 @@ impl fmt::Display for DiskSearchStats {
         let fmt_us = |v: f64| -> String { format!("{:.1}us", v) };
         let fmt_pct = |v: f64| -> String { format!("{:.1}%", v) };
 
-        let cols: [(&str, usize); 14] = [
+        let cols: [(&str, usize); 19] = [
             ("L", 2),
             ("KNN", 3),
             ("QPS", 8),
@@ -409,11 +552,16 @@ impl fmt::Display for DiskSearchStats {
             ("95% Latency", 13),
             ("99.9 Latency", 13),
             ("IOs", 6),
+            ("Traversal IO", 12),
+            ("Rerank IO", 9),
             ("IO (us)", 10),
             ("CPU (us)", 10),
             ("PQ Preprocess (us)", 20),
+            ("Routing (us)", 13),
             ("Mean Comps", 11),
             ("Mean Hops", 10),
+            ("Frontier", 9),
+            ("Cache Hits", 10),
             ("Cache Hit %", 12),
             ("Recall", 7),
         ];
@@ -451,7 +599,7 @@ impl fmt::Display for DiskSearchStats {
 
         for r in &self.search_results_per_l {
             // Prepare values as strings with numeric formatting
-            let vals: [String; 14] = [
+            let vals: [String; 19] = [
                 format!("{}", r.search_l),
                 format!("{}", self.recall_at),
                 format!("{:.1}", r.qps),
@@ -459,11 +607,16 @@ impl fmt::Display for DiskSearchStats {
                 format!("{}", r.p95_latency),
                 format!("{}", r.p999_latency),
                 format!("{:.1}", r.mean_ios),
+                format!("{:.1}", r.mean_traversal_uncached_reads),
+                format!("{:.1}", r.mean_rerank_uncached_reads),
                 fmt_us(r.mean_io_time),
                 fmt_us(r.mean_cpu_time),
                 fmt_us(r.mean_pq_preprocess_time),
+                fmt_us(r.mean_routing_time),
                 format!("{:.1}", r.mean_comparisons),
                 format!("{:.1}", r.mean_hops),
+                format!("{:.1}", r.mean_frontier_nodes_requested),
+                format!("{:.1}", r.mean_frontier_cache_hits),
                 fmt_pct(r.cache_hit_percentage),
                 format!("{:.3}", r.recall),
             ];

@@ -41,6 +41,8 @@ This crate has been populated with the core disk index functionality from the ma
 
 An optional sidecar can select graph entry points from an in-memory set of real vectors. The disk
 graph is unchanged, so the same index can be benchmarked with either its medoid or routed entries.
+Routing vectors are stored as `f32` independently of the index's native vector type, preserving
+Search-PQ reconstruction precision for `uint8`, `int8`, and `fp16` indexes.
 
 Generate a table with k-means++ initialization and Lloyd iterations:
 
@@ -68,6 +70,16 @@ searcher.load_routing_table(
 `clear_routing_table()` restores medoid-based search. Compare `routing_time_us`,
 `total_io_operations`, `search_hops`, recall, and end-to-end latency while sweeping the number of
 centers and selected entries.
+
+For representative-query cache training, the disk benchmark accepts `cache_sample_queries` together
+with `num_nodes_to_cache`. It runs an untimed, uncached graph-search pass, ranks expanded frontier
+nodes by visit frequency, and loads the exact Top-K IDs into the static cache before measurement.
+Use a query sample that is separate from the measured query set. The output reports
+`frontier_cache_hits`, `traversal_uncached_reads`, and `rerank_uncached_reads` separately.
+
+To cluster Search-PQ reconstructed vectors instead of the original data, pass
+`--pq-pivots-file`, `--pq-compressed-file`, and `--distance l2` or
+`--distance innerproduct`.
 
 ### Data Model Module
 

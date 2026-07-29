@@ -20,7 +20,10 @@ use diskann::{
         self,
         ext::labeled::{self, QueryLabelProvider},
         glue::{self, DefaultPostProcessor, SearchPostProcess, SearchStrategy},
-        search::{AdaptiveL, InlineFilterSearch, Knn},
+        search::{
+            record::{NoopSearchRecord, SearchRecord, VisitedSearchRecord},
+            AdaptiveL, InlineFilterSearch, Knn, RecordedKnn,
+        },
         search_output_buffer, DiskANNIndex,
     },
     neighbor::{Neighbor, NeighborPriorityQueue},
@@ -250,7 +253,7 @@ where
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: &'a Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
 
-    routing_table: Option<&'a RoutingTable<Data::VectorDataType>>,
+    routing_table: Option<&'a RoutingTable>,
     routing_entry_count: NonZeroUsize,
 }
 
@@ -260,7 +263,18 @@ struct IOTracker {
     io_time_us: AtomicU64,
     preprocess_time_us: AtomicU64,
     routing_time_us: AtomicU64,
+    // Physical disk reads (uncached vertex fetches). Cached hits do not count.
     io_count: AtomicUsize,
+    // Logical vertices visited/loaded (including cache hits).
+    vertices_loaded: AtomicUsize,
+    // Graph-frontier nodes considered for expansion before the IO-limit gate.
+    frontier_nodes_requested: AtomicUsize,
+    // Graph-frontier nodes served by the static node cache.
+    frontier_cache_hits: AtomicUsize,
+    // Physical reads issued by graph traversal.
+    traversal_io_count: AtomicUsize,
+    // Physical reads issued by full-precision reranking.
+    rerank_io_count: AtomicUsize,
 }
 
 impl Default for IOTracker {
@@ -270,6 +284,11 @@ impl Default for IOTracker {
             preprocess_time_us: AtomicU64::new(0),
             routing_time_us: AtomicU64::new(0),
             io_count: AtomicUsize::new(0),
+            vertices_loaded: AtomicUsize::new(0),
+            frontier_nodes_requested: AtomicUsize::new(0),
+            frontier_cache_hits: AtomicUsize::new(0),
+            traversal_io_count: AtomicUsize::new(0),
+            rerank_io_count: AtomicUsize::new(0),
         }
     }
 }
@@ -291,6 +310,60 @@ impl IOTracker {
     fn io_count(&self) -> usize {
         self.io_count.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn add_vertices_loaded(&self, count: usize) {
+        self.vertices_loaded
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn vertices_loaded(&self) -> usize {
+        self.vertices_loaded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn add_frontier_nodes_requested(&self, count: usize) {
+        self.frontier_nodes_requested
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn frontier_nodes_requested(&self) -> usize {
+        self.frontier_nodes_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn add_frontier_cache_hits(&self, count: usize) {
+        self.frontier_cache_hits
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn frontier_cache_hits(&self) -> usize {
+        self.frontier_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn add_phase_io_count(&self, phase: LoadPhase, count: usize) {
+        let counter = match phase {
+            LoadPhase::Traversal => &self.traversal_io_count,
+            LoadPhase::Rerank => &self.rerank_io_count,
+        };
+        counter.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn traversal_io_count(&self) -> usize {
+        self.traversal_io_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn rerank_io_count(&self) -> usize {
+        self.rerank_io_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LoadPhase {
+    Traversal,
+    Rerank,
 }
 
 #[derive(Clone, Copy)]
@@ -342,7 +415,7 @@ where
     async fn post_process<I, B>(
         &self,
         accessor: &mut DiskAccessor<'_, Data, VP>,
-        query: &[Data::VectorDataType],
+        _query: &[Data::VectorDataType],
         candidates: I,
         output: &mut B,
     ) -> Result<usize, Self::Error>
@@ -352,8 +425,6 @@ where
             + Send
             + ?Sized,
     {
-        let provider = accessor.provider;
-
         let mut uncached_ids = Vec::new();
         let mut reranked = {
             let mut process = |n: u32| {
@@ -377,12 +448,29 @@ where
             }
         };
         if !uncached_ids.is_empty() {
-            ensure_vertex_loaded(&mut accessor.scratch.vertex_provider, &uncached_ids)?;
-            for n in &uncached_ids {
-                let v = accessor.scratch.vertex_provider.get_vector(n)?;
-                let d = provider.distance_comparer.evaluate_similarity(query, v);
-                let a = accessor.scratch.vertex_provider.get_associated_data(n)?;
-                reranked.push(((*n, *a), d));
+            let mut remaining_io = accessor
+                .provider
+                .search_io_limit
+                .saturating_sub(accessor.io_tracker.io_count());
+            let ids_to_load = uncached_ids
+                .into_iter()
+                .filter(|id| {
+                    if accessor.scratch.vertex_provider.is_cached(id) {
+                        true
+                    } else if remaining_io > 0 {
+                        remaining_io -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .collect::<Vec<_>>();
+            accessor.ensure_loaded(&ids_to_load, LoadPhase::Rerank)?;
+            for n in &ids_to_load {
+                let entry = accessor.scratch.distance_cache.get(n).ok_or_else(|| {
+                    ANNError::log_index_error("reranked vertex was not loaded into distance cache")
+                })?;
+                reranked.push(((*n, entry.1), entry.0));
             }
         }
 
@@ -643,19 +731,25 @@ where
     where
         F: FnMut(f32, u32),
     {
-        let pq_scratch = &mut self.scratch.pq_scratch;
-        compute_pq_distance(
-            ids,
-            self.provider.pq_data.get_num_chunks(),
-            &pq_scratch.aligned_pqtable_dist_scratch,
-            self.provider.pq_data.pq_compressed_data().as_slice(),
-            &mut pq_scratch.aligned_pq_coord_scratch,
-            &mut pq_scratch.aligned_dist_scratch,
-        )?;
+        // The PQ scratch buffers are sized to `graph_degree`, but the set of starting
+        // points (e.g. query-aware routing entries) may exceed that. Process the ids in
+        // batches that fit the scratch so any number of entry points is supported.
+        let batch = self.scratch.pq_scratch.max_vectors().max(1);
+        for chunk in ids.chunks(batch) {
+            let pq_scratch = &mut self.scratch.pq_scratch;
+            compute_pq_distance(
+                chunk,
+                self.provider.pq_data.get_num_chunks(),
+                &pq_scratch.aligned_pqtable_dist_scratch,
+                self.provider.pq_data.pq_compressed_data().as_slice(),
+                &mut pq_scratch.aligned_pq_coord_scratch,
+                &mut pq_scratch.aligned_dist_scratch,
+            )?;
 
-        for (i, id) in ids.iter().enumerate() {
-            let distance = self.scratch.pq_scratch.aligned_dist_scratch[i];
-            f(distance, *id);
+            for (i, id) in chunk.iter().enumerate() {
+                let distance = self.scratch.pq_scratch.aligned_dist_scratch[i];
+                f(distance, *id);
+            }
         }
 
         Ok(())
@@ -699,10 +793,36 @@ where
         F: FnMut(Self::Id, f32) + Send,
     {
         let result = (|| {
-            let io_limit = self.provider.search_io_limit - self.io_tracker.io_count();
-            let load_ids: Box<[_]> = ids.take(io_limit).collect();
+            let requested_ids: Box<[_]> = ids.collect();
+            self.io_tracker
+                .add_frontier_nodes_requested(requested_ids.len());
+            self.io_tracker.add_frontier_cache_hits(
+                requested_ids
+                    .iter()
+                    .filter(|id| self.scratch.vertex_provider.is_cached(id))
+                    .count(),
+            );
 
-            self.ensure_loaded(&load_ids)?;
+            let mut remaining_io = self
+                .provider
+                .search_io_limit
+                .saturating_sub(self.io_tracker.io_count());
+            let load_ids: Box<[_]> = requested_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    if self.scratch.vertex_provider.is_cached(id) {
+                        true
+                    } else if remaining_io > 0 {
+                        remaining_io -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+
+            self.ensure_loaded(&load_ids, LoadPhase::Traversal)?;
             let mut ids = Vec::new();
             for i in load_ids {
                 ids.clear();
@@ -740,7 +860,7 @@ where
         query: &'a [Data::VectorDataType],
         vertex_provider_factory: &'a VPF,
         scratch_pool: &'a Arc<ObjectPool<DiskSearchScratch<Data, VP>>>,
-        routing_table: Option<&RoutingTable<Data::VectorDataType>>,
+        routing_table: Option<&RoutingTable>,
         routing_entry_count: NonZeroUsize,
     ) -> ANNResult<Self>
     where
@@ -763,7 +883,7 @@ where
         scratch.pq_scratch.set(&f32_query)?;
         let routing_timer = Instant::now();
         let start_points = match routing_table {
-            Some(table) => table.select(query, provider.metric, routing_entry_count)?,
+            Some(table) => table.select(&f32_query, provider.metric, routing_entry_count)?,
             None => vec![provider.graph_header.metadata().medoid as u32],
         };
         IOTracker::add_time(
@@ -792,18 +912,28 @@ where
         })
     }
 
-    fn ensure_loaded(&mut self, ids: &[u32]) -> Result<(), ANNError> {
+    fn ensure_loaded(&mut self, ids: &[u32], phase: LoadPhase) -> Result<(), ANNError> {
         if ids.is_empty() {
             return Ok(());
         }
         let scratch = &mut self.scratch;
         let timer = Instant::now();
+        // Snapshot physical reads before/after so cache hits are excluded from the IO count.
+        let physical_before = scratch.vertex_provider.io_operations();
         ensure_vertex_loaded(&mut scratch.vertex_provider, ids)?;
+        let physical_read = scratch
+            .vertex_provider
+            .io_operations()
+            .saturating_sub(physical_before) as usize;
         IOTracker::add_time(
             &self.io_tracker.io_time_us,
             timer.elapsed().as_micros() as u64,
         );
-        self.io_tracker.add_io_count(ids.len());
+        // `io_count` tracks physical disk reads (uncached); `vertices_loaded` tracks all
+        // vertices visited (including cache hits).
+        self.io_tracker.add_io_count(physical_read);
+        self.io_tracker.add_phase_io_count(phase, physical_read);
+        self.io_tracker.add_vertices_loaded(ids.len());
         for id in ids {
             let distance = self
                 .provider
@@ -837,7 +967,7 @@ pub struct DiskIndexSearcher<
     /// Scratch pool for disk search operations that need allocations.
     scratch_pool: Arc<ObjectPool<DiskSearchScratch<Data, ProviderFactory::VertexProviderType>>>,
 
-    routing_table: Option<Arc<RoutingTable<Data::VectorDataType>>>,
+    routing_table: Option<Arc<RoutingTable>>,
     routing_entry_count: NonZeroUsize,
 }
 
@@ -961,7 +1091,7 @@ where
     /// Enable query-aware graph entry routing with an in-memory table.
     pub fn set_routing_table(
         &mut self,
-        table: RoutingTable<Data::VectorDataType>,
+        table: RoutingTable,
         entry_count: NonZeroUsize,
     ) -> ANNResult<()> {
         if entry_count.get() > table.len() {
@@ -974,7 +1104,7 @@ where
                 ),
             ));
         }
-        let graph_dimension = self.index.provider().graph_header.metadata().dims as usize;
+        let graph_dimension = self.index.provider().graph_header.metadata().dims;
         if table.dimension() != graph_dimension {
             return Err(ANNError::log_index_config_error(
                 "routing_dimension".into(),
@@ -1148,7 +1278,6 @@ where
         let mut distances = vec![0f32; return_list_size as usize];
         let mut associated_data =
             vec![Data::AssociatedDataType::default(); return_list_size as usize];
-
         let stats = self.search_internal(
             query,
             return_list_size as usize,
@@ -1160,7 +1289,70 @@ where
             &mut associated_data,
             &mode,
         )?;
+        Ok(Self::assemble_search_result(
+            return_list_size,
+            indices,
+            distances,
+            associated_data,
+            stats,
+        ))
+    }
 
+    /// Perform graph search and return the IDs of all expanded frontier nodes.
+    ///
+    /// This is intended for offline cache training and does not alter traversal or
+    /// result-selection semantics.
+    pub fn search_with_visited_nodes(
+        &self,
+        query: &[Data::VectorDataType],
+        return_list_size: u32,
+        search_list_size: u32,
+        beam_width: Option<usize>,
+        mode: SearchMode<'_>,
+    ) -> ANNResult<(SearchResult<Data::AssociatedDataType>, Vec<u32>)> {
+        if !matches!(&mode, SearchMode::Graph { .. }) {
+            return Err(ANNError::log_index_config_error(
+                "cache_sample_queries".into(),
+                "visit recording currently supports graph search only".into(),
+            ));
+        }
+
+        let mut recorder = VisitedSearchRecord::new(search_list_size as usize);
+        let mut query_stats = QueryStatistics::default();
+        let mut indices = vec![0u32; return_list_size as usize];
+        let mut distances = vec![0f32; return_list_size as usize];
+        let mut associated_data =
+            vec![Data::AssociatedDataType::default(); return_list_size as usize];
+        let stats = self.search_internal_with_record(
+            query,
+            return_list_size as usize,
+            search_list_size,
+            beam_width,
+            &mut query_stats,
+            &mut indices,
+            &mut distances,
+            &mut associated_data,
+            &mode,
+            Some(&mut recorder),
+        )?;
+        let visited = recorder.ids().collect();
+        let result = Self::assemble_search_result(
+            return_list_size,
+            indices,
+            distances,
+            associated_data,
+            stats,
+        );
+        Ok((result, visited))
+    }
+
+    fn assemble_search_result(
+        return_list_size: u32,
+        indices: Vec<u32>,
+        distances: Vec<f32>,
+        associated_data: Vec<Data::AssociatedDataType>,
+        stats: SearchResultStats,
+    ) -> SearchResult<Data::AssociatedDataType> {
         let mut search_result = SearchResult {
             results: Vec::with_capacity(return_list_size as usize),
             stats,
@@ -1178,7 +1370,7 @@ where
             });
         }
 
-        Ok(search_result)
+        search_result
     }
 
     /// Perform a raw search on the disk index.
@@ -1196,6 +1388,37 @@ where
         associated_data: &mut [Data::AssociatedDataType],
         mode: &SearchMode<'_>,
     ) -> ANNResult<SearchResultStats> {
+        self.search_internal_with_record::<NoopSearchRecord>(
+            query,
+            k_value,
+            search_list_size,
+            beam_width,
+            query_stats,
+            indices,
+            distances,
+            associated_data,
+            mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_internal_with_record<SR>(
+        &self,
+        query: &[Data::VectorDataType],
+        k_value: usize,
+        search_list_size: u32,
+        beam_width: Option<usize>,
+        query_stats: &mut QueryStatistics,
+        indices: &mut [u32],
+        distances: &mut [f32],
+        associated_data: &mut [Data::AssociatedDataType],
+        mode: &SearchMode<'_>,
+        recorder: Option<&mut SR>,
+    ) -> ANNResult<SearchResultStats>
+    where
+        SR: SearchRecord<u32> + ?Sized,
+    {
         let mut result_output_buffer = search_output_buffer::IdDistanceAssociatedData::new(
             &mut indices[..k_value],
             &mut distances[..k_value],
@@ -1236,13 +1459,22 @@ where
                         .map_or(PostprocessStrategy::AcceptAll, PostprocessStrategy::Apply),
                 );
                 let knn_search = Knn::new(k, l, beam_width)?;
-                self.runtime.block_on(self.index.search(
-                    knn_search,
-                    &strategy,
-                    &DefaultContext,
-                    query,
-                    &mut result_output_buffer,
-                ))?
+                match recorder {
+                    Some(recorder) => self.runtime.block_on(self.index.search(
+                        RecordedKnn::new(knn_search, recorder),
+                        &strategy,
+                        &DefaultContext,
+                        query,
+                        &mut result_output_buffer,
+                    ))?,
+                    None => self.runtime.block_on(self.index.search(
+                        knn_search,
+                        &strategy,
+                        &DefaultContext,
+                        query,
+                        &mut result_output_buffer,
+                    ))?,
+                }
             }
             SearchMode::InlineFilter { filter, adaptive_l } => {
                 // Strategy is passed by value into `filter_search` so that the
@@ -1287,7 +1519,15 @@ where
         query_stats.total_execution_time_us = timer.elapsed().as_micros();
         query_stats.io_time_us = IOTracker::time(&io_tracker.io_time_us) as u128;
         query_stats.total_io_operations = io_tracker.io_count() as u32;
-        query_stats.total_vertices_loaded = io_tracker.io_count() as u32;
+        query_stats.total_vertices_loaded = io_tracker.vertices_loaded() as u32;
+        query_stats.frontier_nodes_requested = io_tracker.frontier_nodes_requested() as u32;
+        query_stats.frontier_cache_hits = io_tracker.frontier_cache_hits() as u32;
+        query_stats.traversal_uncached_reads = io_tracker.traversal_io_count() as u32;
+        query_stats.rerank_uncached_reads = io_tracker.rerank_io_count() as u32;
+        debug_assert_eq!(
+            query_stats.total_io_operations,
+            query_stats.traversal_uncached_reads + query_stats.rerank_uncached_reads
+        );
         query_stats.query_pq_preprocess_time_us =
             IOTracker::time(&io_tracker.preprocess_time_us) as u128;
         query_stats.routing_time_us = IOTracker::time(&io_tracker.routing_time_us) as u128;
@@ -1962,6 +2202,51 @@ mod disk_provider_tests {
             indices,
             vec![152, 72, 170, 118, 87, 165, 79, 141, 108, 86],
             "Expected indices to match"
+        );
+        assert_eq!(
+            search_result
+                .stats
+                .query_statistics
+                .frontier_nodes_requested,
+            search_result.stats.query_statistics.search_hops
+        );
+        assert_eq!(search_result.stats.query_statistics.frontier_cache_hits, 0);
+        assert_eq!(
+            search_result
+                .stats
+                .query_statistics
+                .traversal_uncached_reads,
+            search_result
+                .stats
+                .query_statistics
+                .frontier_nodes_requested
+        );
+        assert_eq!(
+            search_result.stats.query_statistics.total_io_operations,
+            search_result
+                .stats
+                .query_statistics
+                .traversal_uncached_reads
+                + search_result.stats.query_statistics.rerank_uncached_reads
+        );
+
+        let (recorded_result, recorded_ids) = search_engine
+            .search_with_visited_nodes(
+                &query_vector,
+                return_list_size,
+                search_list_size,
+                Some(4),
+                SearchMode::graph(),
+            )
+            .unwrap();
+        assert_eq!(recorded_ids, EXPECTED_NODES);
+        assert_eq!(
+            recorded_result
+                .results
+                .iter()
+                .map(|result| result.vertex_id)
+                .collect::<Vec<_>>(),
+            indices
         );
     }
 

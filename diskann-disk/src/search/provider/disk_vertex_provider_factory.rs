@@ -167,7 +167,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
 
                 let start_node = graph_metadata.medoid as u32;
                 self.cache = Some(Arc::new(self.build_cache_via_bfs(
-                    start_node,
+                    &[start_node],
                     num_nodes_to_cache,
                     graph_metadata.dims,
                 )?));
@@ -179,9 +179,98 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         Ok(())
     }
 
+    /// (Re)build the static node cache seeded from an explicit set of graph nodes
+    /// (e.g. query-aware routing entry points) instead of the graph medoid.
+    ///
+    /// The BFS starts from every node in `seeds`, so the seeds and their surrounding
+    /// neighborhood are made resident in memory, making the first search hops from any
+    /// chosen entry point IO-free. Passing an empty `seeds` or a zero budget is a no-op.
+    pub fn seed_cache_from_nodes(
+        &mut self,
+        seeds: &[u32],
+        num_nodes_to_cache: usize,
+    ) -> ANNResult<()> {
+        if seeds.is_empty() || num_nodes_to_cache == 0 {
+            return Ok(());
+        }
+
+        let graph_metadata = self.get_header()?;
+        let graph_metadata = graph_metadata.metadata();
+        let num_nodes_to_cache = min(num_nodes_to_cache, graph_metadata.num_pts as usize);
+
+        let cache = self.build_cache_via_bfs(seeds, num_nodes_to_cache, graph_metadata.dims)?;
+        self.cache = Some(Arc::new(cache));
+        self.caching_strategy = CachingStrategy::StaticCacheWithBfsNodes(num_nodes_to_cache);
+        Ok(())
+    }
+
+    /// Build a static cache containing the supplied graph nodes in the given order.
+    ///
+    /// Unlike [`Self::seed_cache_from_nodes`], this does not expand graph neighbors.
+    /// Duplicate IDs are ignored and the first `num_nodes_to_cache` unique IDs are used.
+    pub fn seed_cache_from_exact_nodes(
+        &mut self,
+        nodes: &[u32],
+        num_nodes_to_cache: usize,
+    ) -> ANNResult<usize> {
+        if nodes.is_empty() || num_nodes_to_cache == 0 {
+            return Ok(0);
+        }
+
+        let graph_metadata = self.get_header()?;
+        let graph_metadata = graph_metadata.metadata();
+        let num_nodes_to_cache = min(num_nodes_to_cache, graph_metadata.num_pts as usize);
+        let mut seen = HashSet::with_capacity(num_nodes_to_cache);
+        let mut selected = Vec::with_capacity(num_nodes_to_cache);
+
+        for &node in nodes {
+            if node as usize >= graph_metadata.num_pts as usize {
+                return Err(ANNError::log_index_config_error(
+                    "cache_node_id".into(),
+                    format!(
+                        "cache node ID {} is outside graph range 0..{}",
+                        node, graph_metadata.num_pts
+                    ),
+                ));
+            }
+            if seen.insert(node) {
+                selected.push(node);
+                if selected.len() == num_nodes_to_cache {
+                    break;
+                }
+            }
+        }
+
+        let cache = self.build_cache_from_exact_nodes(&selected, graph_metadata.dims)?;
+        let cache_len = cache.len();
+        self.cache = Some(Arc::new(cache));
+        self.caching_strategy = CachingStrategy::StaticCacheWithBfsNodes(cache_len);
+        Ok(cache_len)
+    }
+
+    fn build_cache_from_exact_nodes(
+        &self,
+        nodes: &[u32],
+        dimension: usize,
+    ) -> ANNResult<Cache<Data>> {
+        info!("Building cache with {} exact nodes.", nodes.len());
+        let mut cache = Cache::new(dimension, nodes.len())?;
+        let mut vertex_provider =
+            self.create_disk_vertex_provider(BEAM_WIDTH_FOR_BFS, &self.get_header()?)?;
+
+        for batch in nodes.chunks(BEAM_WIDTH_FOR_BFS) {
+            vertex_provider.load_vertices(batch)?;
+            for (idx, node) in batch.iter().enumerate() {
+                Self::insert_in_cache(node, idx, &mut vertex_provider, &mut cache)?;
+            }
+        }
+
+        Ok(cache)
+    }
+
     fn build_cache_via_bfs(
         &self,
-        start_node: u32,
+        start_nodes: &[u32],
         num_nodes_to_cache: usize,
         dimension: usize,
     ) -> ANNResult<Cache<Data>> {
@@ -194,8 +283,11 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         let mut queue = VecDeque::with_capacity(num_nodes_to_cache);
         let mut nodes_in_a_batch = Vec::with_capacity(BEAM_WIDTH_FOR_BFS);
 
-        queue.push_back(start_node);
-        visited.insert(start_node);
+        for &start_node in start_nodes {
+            if visited.insert(start_node) {
+                queue.push_back(start_node);
+            }
+        }
 
         while (!queue.is_empty()) && cache.len() < num_nodes_to_cache {
             nodes_in_a_batch.clear();
@@ -302,6 +394,30 @@ pub(crate) mod tests {
         let cache = factory.cache.as_ref().unwrap();
         assert!(!cache.is_empty());
         assert!(cache.len() <= num_nodes_to_cache);
+    }
+
+    #[test]
+    fn test_seed_cache_from_exact_nodes_preserves_order_and_deduplicates() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let mut factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider),
+            CachingStrategy::None,
+        )
+        .unwrap();
+
+        let cached = factory
+            .seed_cache_from_exact_nodes(&[7, 3, 7, 20, 9], 3)
+            .unwrap();
+
+        assert_eq!(cached, 3);
+        let cache = factory.cache.as_ref().unwrap();
+        assert!(cache.contains(&7));
+        assert!(cache.contains(&3));
+        assert!(cache.contains(&20));
+        assert!(!cache.contains(&9));
     }
 
     #[test]

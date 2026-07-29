@@ -918,6 +918,7 @@ dependencies = [
  "byteorder",
  "clap",
  "diskann",
+ "diskann-disk",
  "diskann-label-filter",
  "diskann-providers",
  "diskann-quantization",

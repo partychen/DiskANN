@@ -50,15 +50,20 @@ pub fn quantizer_preprocess(
     }
 
     // Compute the pq distance between query vector to all the vertex in the pq
-    // calculation id scratch.
-    compute_pq_distance(
-        id_to_calculate_pq_distance,
-        pq_data.get_num_chunks(),
-        &pq_scratch.aligned_pqtable_dist_scratch,
-        pq_data.pq_compressed_data().as_slice(),
-        &mut pq_scratch.aligned_pq_coord_scratch,
-        &mut pq_scratch.aligned_dist_scratch,
-    )?;
+    // calculation id scratch. The scratch buffers are sized to `graph_degree`, but
+    // the id set (e.g. query-aware routing entries) may exceed that, so process in
+    // batches that fit the scratch.
+    let batch = pq_scratch.aligned_dist_scratch.len().max(1);
+    for chunk in id_to_calculate_pq_distance.chunks(batch) {
+        compute_pq_distance(
+            chunk,
+            pq_data.get_num_chunks(),
+            &pq_scratch.aligned_pqtable_dist_scratch,
+            pq_data.pq_compressed_data().as_slice(),
+            &mut pq_scratch.aligned_pq_coord_scratch,
+            &mut pq_scratch.aligned_dist_scratch,
+        )?;
+    }
 
     Ok(())
 }

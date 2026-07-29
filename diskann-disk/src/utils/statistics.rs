@@ -24,6 +24,18 @@ pub struct QueryStatistics {
     /// Total number of IO operations issued.
     pub total_io_operations: u32,
 
+    /// Number of graph-frontier nodes requested for traversal.
+    pub frontier_nodes_requested: u32,
+
+    /// Number of requested graph-frontier nodes served by the static node cache.
+    pub frontier_cache_hits: u32,
+
+    /// Number of uncached vertex reads issued during graph traversal.
+    pub traversal_uncached_reads: u32,
+
+    /// Number of uncached vertex reads issued during full-precision reranking.
+    pub rerank_uncached_reads: u32,
+
     /// Number of saved comparisons (optimization metric).
     pub comparisons_saved: u32,
 

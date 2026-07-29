@@ -105,6 +105,10 @@ where
         self.vector_provider.io_operations()
     }
 
+    fn is_cached(&self, vertex_id: &Data::VectorIdType) -> bool {
+        self.cache.contains(vertex_id)
+    }
+
     fn clear(&mut self) {
         self.clear_before_next_read();
         self.vector_provider.clear();

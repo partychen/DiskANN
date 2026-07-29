@@ -15,7 +15,9 @@ pub mod math_util;
 pub use math_util::{compute_closest_centers, compute_closest_centers_in_block, compute_vecs_l2sq};
 
 pub mod kmeans;
-pub use kmeans::{k_means_clustering, k_meanspp_selecting_pivots, run_lloyds};
+pub use kmeans::{
+    k_means_clustering, k_meanspp_selecting_pivots, run_lloyds, spherical_k_means_clustering,
+};
 
 pub mod instrumentation;
 

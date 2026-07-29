@@ -424,6 +424,70 @@ pub fn k_means_clustering(
     Ok((closest_docs, closest_center, residual))
 }
 
+/// Cluster unit-normalized vectors with spherical Lloyd iterations.
+///
+/// Centers are normalized after every update, so assigning by squared L2 is
+/// equivalent to assigning by maximum cosine similarity.
+#[allow(clippy::too_many_arguments)]
+pub fn spherical_k_means_clustering(
+    data: &[f32],
+    num_points: usize,
+    dim: usize,
+    centers: &mut [f32],
+    num_centers: usize,
+    max_reps: usize,
+    rng: &mut impl Rng,
+    cancellation_token: &mut bool,
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<()> {
+    k_meanspp_selecting_pivots(
+        data,
+        num_points,
+        dim,
+        centers,
+        num_centers,
+        rng,
+        cancellation_token,
+        pool,
+    )?;
+
+    let mut closest_docs = vec![Vec::new(); num_centers];
+    let mut closest_center = vec![0; num_points];
+    let mut docs_l2sq = vec![0.0; num_points];
+    compute_vecs_l2sq(&mut docs_l2sq, data, dim, pool)?;
+
+    for _ in 0..max_reps {
+        if *cancellation_token {
+            return Err(ANNError::log_pq_error(
+                "Error: Cancellation requested by caller.",
+            ));
+        }
+
+        lloyds_iter(
+            data,
+            num_points,
+            dim,
+            centers,
+            num_centers,
+            &docs_l2sq,
+            &mut closest_docs,
+            &mut closest_center,
+            pool,
+        )?;
+
+        for center in centers.chunks_exact_mut(dim) {
+            let norm = center.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for value in center {
+                    *value /= norm;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod kmeans_test {
     use approx::assert_relative_eq;
@@ -1058,5 +1122,31 @@ mod kmeans_test {
 
         assert_eq!(err.kind(), ANNErrorKind::PQError);
         assert!(err.to_string().contains("Cancellation requested by caller"));
+    }
+
+    #[test]
+    fn spherical_k_means_keeps_centers_normalized() {
+        let data = [
+            1.0f32, 0.0, 0.8, 0.6, 0.0, 1.0, -1.0, 0.0, -0.8, -0.6, 0.0, -1.0,
+        ];
+        let mut centers = [0.0; 4];
+        let mut rng = create_rnd_in_tests();
+        spherical_k_means_clustering(
+            &data,
+            6,
+            2,
+            &mut centers,
+            2,
+            4,
+            &mut rng,
+            &mut false,
+            create_thread_pool_for_test().as_ref(),
+        )
+        .unwrap();
+
+        for center in centers.chunks_exact(2) {
+            let norm = center.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert_relative_eq!(norm, 1.0, epsilon = 1e-6);
+        }
     }
 }
