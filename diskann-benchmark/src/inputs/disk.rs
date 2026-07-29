@@ -181,6 +181,10 @@ pub(crate) struct DiskSearchPhase {
     /// graph-frontier visit frequency before the measured search begins.
     #[serde(default)]
     pub(crate) cache_sample_queries: Option<InputFile>,
+    /// Fraction of the static cache reserved for routing-root multi-source BFS before
+    /// visit-frequency nodes fill the remaining unique slots.
+    #[serde(default)]
+    pub(crate) cache_bfs_fraction: Option<f64>,
 }
 
 /////////
@@ -331,6 +335,12 @@ impl DiskSearchPhase {
         if self.cache_sample_queries.is_some() && self.num_nodes_to_cache.is_none() {
             anyhow::bail!("num_nodes_to_cache is required when cache_sample_queries is specified");
         }
+        validate_hybrid_cache_config(
+            self.cache_bfs_fraction,
+            self.routing_table.is_some(),
+            self.cache_sample_queries.is_some(),
+            self.num_nodes_to_cache.is_some(),
+        )?;
         #[cfg(feature = "disk-index")]
         if self.cache_sample_queries.is_some()
             && (self.search_mode.is_flat_search
@@ -401,6 +411,7 @@ impl Example for DiskIndexOperation {
             routing_table: None,
             routing_entry_count: None,
             cache_sample_queries: None,
+            cache_bfs_fraction: None,
         };
 
         Self {
@@ -550,6 +561,10 @@ impl DiskSearchPhase {
             Some(queries) => write_field!(f, "Cache Sample Queries", queries.display())?,
             None => write_field!(f, "Cache Sample Queries", "none (BFS cache)")?,
         }
+        match self.cache_bfs_fraction {
+            Some(fraction) => write_field!(f, "Cache BFS Fraction", format!("{fraction:.3}"))?,
+            None => write_field!(f, "Cache BFS Fraction", "none")?,
+        }
         Ok(())
     }
 }
@@ -558,5 +573,53 @@ impl fmt::Display for DiskSearchPhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Disk Index Search Phase")?;
         self.summarize_fields(f)
+    }
+}
+
+fn validate_hybrid_cache_config(
+    bfs_fraction: Option<f64>,
+    has_routing_table: bool,
+    has_sample_queries: bool,
+    has_cache_budget: bool,
+) -> anyhow::Result<()> {
+    let Some(bfs_fraction) = bfs_fraction else {
+        return Ok(());
+    };
+    if !bfs_fraction.is_finite() || !(0.0..=1.0).contains(&bfs_fraction) {
+        anyhow::bail!("cache_bfs_fraction must be a finite value in [0, 1]");
+    }
+    if !(has_routing_table && has_sample_queries && has_cache_budget) {
+        anyhow::bail!(
+            "cache_bfs_fraction requires routing_table, cache_sample_queries, and \
+             num_nodes_to_cache"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_hybrid_cache_config;
+
+    #[test]
+    fn hybrid_cache_fraction_accepts_endpoints_and_interior() {
+        for fraction in [0.0, 0.25, 1.0] {
+            validate_hybrid_cache_config(Some(fraction), true, true, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn hybrid_cache_fraction_rejects_invalid_ratios() {
+        for fraction in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(validate_hybrid_cache_config(Some(fraction), true, true, true).is_err());
+        }
+    }
+
+    #[test]
+    fn hybrid_cache_fraction_requires_all_inputs() {
+        assert!(validate_hybrid_cache_config(Some(0.5), false, true, true).is_err());
+        assert!(validate_hybrid_cache_config(Some(0.5), true, false, true).is_err());
+        assert!(validate_hybrid_cache_config(Some(0.5), true, true, false).is_err());
+        validate_hybrid_cache_config(None, false, false, false).unwrap();
     }
 }

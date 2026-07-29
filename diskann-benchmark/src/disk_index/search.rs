@@ -23,7 +23,7 @@ use diskann_disk::{
     search::{
         provider::{
             disk_provider::DiskIndexSearcher,
-            disk_vertex_provider_factory::DiskVertexProviderFactory,
+            disk_vertex_provider_factory::{DiskVertexProviderFactory, HybridCacheComposition},
         },
         search_mode::SearchMode,
     },
@@ -56,8 +56,23 @@ pub(super) struct DiskSearchStats {
     pub(crate) distance: SimilarityMeasure,
     pub(crate) uses_vector_filters: bool,
     pub(super) num_nodes_to_cache: Option<usize>,
+    #[serde(default)]
+    pub(super) cache_composition: Option<HybridCacheStats>,
     pub(super) search_results_per_l: Vec<DiskSearchResult>,
     span_metrics: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub(super) struct HybridCacheStats {
+    pub(super) requested_bfs_fraction: f64,
+    pub(super) requested_bfs_nodes: usize,
+    pub(super) routing_root_nodes: usize,
+    pub(super) actual_bfs_nodes: usize,
+    pub(super) actual_frequency_nodes: usize,
+    pub(super) fallback_bfs_nodes: usize,
+    pub(super) total_cached_nodes: usize,
+    pub(super) cache_coverage_percentage: f64,
+    pub(super) estimated_payload_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -308,7 +323,7 @@ where
                 }
             }
             let unique_visited = visit_counts.len();
-            if unique_visited < cache_budget {
+            if unique_visited < cache_budget && search_params.cache_bfs_fraction.is_none() {
                 anyhow::bail!(
                     "cache sample queries visited only {unique_visited} unique nodes, fewer than \
                      the requested cache budget {cache_budget}"
@@ -343,15 +358,36 @@ where
     let mut vertex_provider_factory =
         DiskVertexProviderFactory::from_disk_index_path(disk_index_path, caching_strategy)?;
 
+    let mut cache_composition = None;
     if let Some(nodes) = &frequency_cache_nodes {
         let cache_budget = search_params
             .num_nodes_to_cache
             .expect("validated frequency cache must have a cache budget");
-        let cached = vertex_provider_factory.seed_cache_from_exact_nodes(nodes, cache_budget)?;
-        if cached != cache_budget {
-            anyhow::bail!(
-                "frequency cache loaded {cached} nodes, expected the full budget {cache_budget}"
-            );
+        if let Some(bfs_fraction) = search_params.cache_bfs_fraction {
+            let routing_table = &routing
+                .as_ref()
+                .expect("validated hybrid cache must have a routing table")
+                .0;
+            let requested_bfs_nodes = ((cache_budget as f64) * bfs_fraction).round() as usize;
+            let composition = vertex_provider_factory.seed_cache_from_hybrid_nodes(
+                routing_table.ids(),
+                nodes,
+                cache_budget,
+                requested_bfs_nodes,
+            )?;
+            cache_composition = Some(HybridCacheStats::new(
+                bfs_fraction,
+                composition,
+                index_reader.get_num_points(),
+            ));
+        } else {
+            let cached =
+                vertex_provider_factory.seed_cache_from_exact_nodes(nodes, cache_budget)?;
+            if cached != cache_budget {
+                anyhow::bail!(
+                    "frequency cache loaded {cached} nodes, expected the full budget {cache_budget}"
+                );
+            }
         }
     } else if let (Some((table, _)), Some(cache_budget)) =
         (&routing, search_params.num_nodes_to_cache)
@@ -496,6 +532,7 @@ where
         distance: search_params.distance,
         uses_vector_filters: search_params.vector_filters_file.is_some(),
         num_nodes_to_cache: search_params.num_nodes_to_cache,
+        cache_composition,
         search_results_per_l,
         span_metrics,
     })
@@ -591,6 +628,19 @@ impl fmt::Display for DiskSearchStats {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "None".to_string())
         )?;
+        if let Some(composition) = &self.cache_composition {
+            writeln!(
+                f,
+                "Hybrid cache,     : bfs {:.1}% ({} actual), frequency {}, fallback {}, total {}, {:.3}% coverage, {} estimated bytes",
+                100.0 * composition.requested_bfs_fraction,
+                composition.actual_bfs_nodes,
+                composition.actual_frequency_nodes,
+                composition.fallback_bfs_nodes,
+                composition.total_cached_nodes,
+                composition.cache_coverage_percentage,
+                composition.estimated_payload_bytes,
+            )?;
+        }
 
         // Table
         writeln!(f, "{rule}")?;
@@ -633,5 +683,30 @@ impl fmt::Display for DiskSearchStats {
         }
 
         Ok(())
+    }
+}
+
+impl HybridCacheStats {
+    fn new(
+        requested_bfs_fraction: f64,
+        composition: HybridCacheComposition,
+        total_graph_nodes: usize,
+    ) -> Self {
+        let cache_coverage_percentage = if total_graph_nodes == 0 {
+            0.0
+        } else {
+            100.0 * composition.total_nodes as f64 / total_graph_nodes as f64
+        };
+        Self {
+            requested_bfs_fraction,
+            requested_bfs_nodes: composition.requested_bfs_nodes,
+            routing_root_nodes: composition.routing_root_nodes,
+            actual_bfs_nodes: composition.bfs_nodes,
+            actual_frequency_nodes: composition.frequency_nodes,
+            fallback_bfs_nodes: composition.fallback_bfs_nodes,
+            total_cached_nodes: composition.total_nodes,
+            cache_coverage_percentage,
+            estimated_payload_bytes: composition.estimated_payload_bytes,
+        }
     }
 }

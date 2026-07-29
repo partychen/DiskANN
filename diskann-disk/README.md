@@ -77,6 +77,14 @@ nodes by visit frequency, and loads the exact Top-K IDs into the static cache be
 Use a query sample that is separate from the measured query set. The output reports
 `frontier_cache_hits`, `traversal_uncached_reads`, and `rerank_uncached_reads` separately.
 
+To combine structural routing coverage with measured hot nodes, also set
+`cache_bfs_fraction` in `[0, 1]`. The benchmark preserves every routing-table root, takes
+the requested prefix of the deterministic multi-source BFS order, then appends unique
+visit-frequency-ranked nodes. If those ranks do not fill `num_nodes_to_cache`, the
+remaining BFS order fills the budget. The result records the requested fraction, effective
+BFS/frequency/fallback composition, node coverage, and an estimated cached payload based on
+the disk graph's node length. Cache setup remains outside measured query time.
+
 To cluster Search-PQ reconstructed vectors instead of the original data, pass
 `--pq-pivots-file`, `--pq-compressed-file`, and `--distance l2` or
 `--distance innerproduct`.

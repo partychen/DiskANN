@@ -31,6 +31,25 @@ use crate::{
 const DEFAULT_DISK_SECTOR_LEN: usize = 4096;
 const BEAM_WIDTH_FOR_BFS: usize = 32;
 
+/// Effective composition of a static hybrid node cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridCacheComposition {
+    /// BFS node target requested by the configured fraction, before preserving roots.
+    pub requested_bfs_nodes: usize,
+    /// Number of unique routing roots that the cache must preserve.
+    pub routing_root_nodes: usize,
+    /// Unique nodes selected from the initial routing-root BFS prefix.
+    pub bfs_nodes: usize,
+    /// Unique visit-frequency nodes added after the BFS prefix.
+    pub frequency_nodes: usize,
+    /// Unique nodes added from the remaining BFS order when frequency ranks underfill.
+    pub fallback_bfs_nodes: usize,
+    /// Total unique nodes loaded into the cache.
+    pub total_nodes: usize,
+    /// Estimated cached graph payload in bytes, using the on-disk node length.
+    pub estimated_payload_bytes: u64,
+}
+
 /// DiskVertexProviderFactory. This is one of the implementations for the `VertexProviderFactory` trait.
 pub struct DiskVertexProviderFactory<
     Data: GraphDataType<VectorIdType = u32>,
@@ -248,6 +267,98 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         Ok(cache_len)
     }
 
+    /// Build one static cache from a routing-root BFS prefix and frequency-ranked nodes.
+    ///
+    /// Every unique routing root is retained even when the requested BFS target is smaller.
+    /// If frequency-ranked nodes cannot fill the budget after deduplication, the remaining
+    /// deterministic BFS order fills the cache.
+    pub fn seed_cache_from_hybrid_nodes(
+        &mut self,
+        seeds: &[u32],
+        frequency_nodes: &[u32],
+        num_nodes_to_cache: usize,
+        requested_bfs_nodes: usize,
+    ) -> ANNResult<HybridCacheComposition> {
+        if seeds.is_empty() {
+            return Err(ANNError::log_index_config_error(
+                "hybrid_cache_seeds".into(),
+                "hybrid cache requires at least one routing root".into(),
+            ));
+        }
+        if num_nodes_to_cache == 0 {
+            return Err(ANNError::log_index_config_error(
+                "hybrid_cache_budget".into(),
+                "hybrid cache budget must be positive".into(),
+            ));
+        }
+
+        let graph_header = self.get_header()?;
+        let graph_metadata = graph_header.metadata();
+        if num_nodes_to_cache > graph_metadata.num_pts as usize {
+            return Err(ANNError::log_index_config_error(
+                "hybrid_cache_budget".into(),
+                format!(
+                    "cache budget {num_nodes_to_cache} exceeds graph point count {}",
+                    graph_metadata.num_pts
+                ),
+            ));
+        }
+        let mut unique_roots = HashSet::with_capacity(seeds.len());
+        for &seed in seeds {
+            if seed as u64 >= graph_metadata.num_pts {
+                return Err(ANNError::log_index_config_error(
+                    "hybrid_cache_seed".into(),
+                    format!(
+                        "routing root {seed} is outside graph range 0..{}",
+                        graph_metadata.num_pts
+                    ),
+                ));
+            }
+            unique_roots.insert(seed);
+        }
+        if unique_roots.len() > num_nodes_to_cache {
+            return Err(ANNError::log_index_config_error(
+                "hybrid_cache_budget".into(),
+                format!(
+                    "cache budget {num_nodes_to_cache} cannot preserve {} unique routing roots",
+                    unique_roots.len()
+                ),
+            ));
+        }
+        if let Some(&node) = frequency_nodes
+            .iter()
+            .find(|&&node| node as u64 >= graph_metadata.num_pts)
+        {
+            return Err(ANNError::log_index_config_error(
+                "hybrid_cache_frequency_node".into(),
+                format!(
+                    "frequency-ranked node {node} is outside graph range 0..{}",
+                    graph_metadata.num_pts
+                ),
+            ));
+        }
+
+        let bfs_nodes = self.collect_nodes_via_bfs(seeds, num_nodes_to_cache)?;
+        let (selected, composition) = compose_hybrid_cache_nodes(
+            &bfs_nodes,
+            frequency_nodes,
+            num_nodes_to_cache,
+            requested_bfs_nodes,
+            unique_roots.len(),
+            graph_metadata.node_len,
+        )?;
+        let cache = self.build_cache_from_exact_nodes(&selected, graph_metadata.dims)?;
+        if cache.len() != num_nodes_to_cache {
+            return Err(ANNError::log_index_error(format!(
+                "hybrid cache loaded {} nodes, expected {num_nodes_to_cache}",
+                cache.len()
+            )));
+        }
+        self.cache = Some(Arc::new(cache));
+        self.caching_strategy = CachingStrategy::StaticCacheWithBfsNodes(num_nodes_to_cache);
+        Ok(composition)
+    }
+
     fn build_cache_from_exact_nodes(
         &self,
         nodes: &[u32],
@@ -276,12 +387,31 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
     ) -> ANNResult<Cache<Data>> {
         info!("Building cache with {} nodes via BFS.", num_nodes_to_cache);
         let mut cache = Cache::new(dimension, num_nodes_to_cache)?;
+        self.walk_bfs(start_nodes, num_nodes_to_cache, Some(&mut cache))?;
+        ANNResult::Ok(cache)
+    }
+
+    fn collect_nodes_via_bfs(
+        &self,
+        start_nodes: &[u32],
+        num_nodes_to_collect: usize,
+    ) -> ANNResult<Vec<u32>> {
+        self.walk_bfs(start_nodes, num_nodes_to_collect, None)
+    }
+
+    fn walk_bfs(
+        &self,
+        start_nodes: &[u32],
+        num_nodes: usize,
+        mut cache: Option<&mut Cache<Data>>,
+    ) -> ANNResult<Vec<u32>> {
         let mut vertex_provider =
             self.create_disk_vertex_provider(BEAM_WIDTH_FOR_BFS, &self.get_header()?)?;
 
-        let mut visited = HashSet::with_capacity(num_nodes_to_cache);
-        let mut queue = VecDeque::with_capacity(num_nodes_to_cache);
+        let mut visited = HashSet::with_capacity(num_nodes);
+        let mut queue = VecDeque::with_capacity(num_nodes);
         let mut nodes_in_a_batch = Vec::with_capacity(BEAM_WIDTH_FOR_BFS);
+        let mut bfs_nodes = Vec::with_capacity(num_nodes);
 
         for &start_node in start_nodes {
             if visited.insert(start_node) {
@@ -289,7 +419,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
             }
         }
 
-        while (!queue.is_empty()) && cache.len() < num_nodes_to_cache {
+        while !queue.is_empty() && bfs_nodes.len() < num_nodes {
             nodes_in_a_batch.clear();
             let batch_size = min(queue.len(), BEAM_WIDTH_FOR_BFS);
             for _ in 0..batch_size {
@@ -302,23 +432,29 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
             vertex_provider.load_vertices(&nodes_in_a_batch)?;
 
             for (idx, node) in nodes_in_a_batch.iter().enumerate() {
-                Self::insert_in_cache(node, idx, &mut vertex_provider, &mut cache)?;
-                let adjacency_list = cache.get_adjacency_list(node).ok_or_else(|| {
-                    ANNError::log_index_error(format!("Error while caching Nodes via BFS: Adjacency List not found for inserted node {} in cache.", node))
-                })?;
+                vertex_provider.process_loaded_node(node, idx)?;
+                let adjacency_list = AdjacencyList::from_iter_untrusted(
+                    vertex_provider.get_adjacency_list(node)?.iter().copied(),
+                );
+                if let Some(cache) = cache.as_deref_mut() {
+                    let vector = vertex_provider.get_vector(node)?;
+                    let associated_data = vertex_provider.get_associated_data(node)?;
+                    cache.insert(node, vector, adjacency_list.clone(), *associated_data)?;
+                }
+                bfs_nodes.push(*node);
                 for neighbor_id in adjacency_list.iter() {
                     if !visited.contains(neighbor_id) {
                         queue.push_back(*neighbor_id);
                         visited.insert(*neighbor_id);
                     }
                 }
-                if cache.len() >= num_nodes_to_cache {
+                if bfs_nodes.len() >= num_nodes {
                     break;
                 }
             }
         }
 
-        ANNResult::Ok(cache)
+        ANNResult::Ok(bfs_nodes)
     }
 
     fn insert_in_cache<AlignedReaderType>(
@@ -331,6 +467,17 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         AlignedReaderType: AlignedFileReader,
     {
         vertex_provider.process_loaded_node(node, idx)?;
+        Self::insert_processed_node_in_cache(node, vertex_provider, cache)
+    }
+
+    fn insert_processed_node_in_cache<AlignedReaderType>(
+        node: &Data::VectorIdType,
+        vertex_provider: &DiskVertexProvider<Data, AlignedReaderType>,
+        cache: &mut Cache<Data>,
+    ) -> ANNResult<()>
+    where
+        AlignedReaderType: AlignedFileReader,
+    {
         let vector = vertex_provider.get_vector(node)?;
         let adjacency_list = vertex_provider.get_adjacency_list(node)?;
         let associated_data = vertex_provider.get_associated_data(node)?;
@@ -342,6 +489,88 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
             *associated_data,
         )
     }
+}
+
+fn compose_hybrid_cache_nodes(
+    bfs_nodes: &[u32],
+    frequency_nodes: &[u32],
+    cache_budget: usize,
+    requested_bfs_nodes: usize,
+    routing_root_nodes: usize,
+    node_len: u64,
+) -> ANNResult<(Vec<u32>, HybridCacheComposition)> {
+    if routing_root_nodes > cache_budget {
+        return Err(ANNError::log_index_config_error(
+            "hybrid_cache_budget".into(),
+            format!(
+                "cache budget {cache_budget} cannot preserve {routing_root_nodes} routing roots"
+            ),
+        ));
+    }
+    if bfs_nodes.len() < routing_root_nodes {
+        return Err(ANNError::log_index_error(format!(
+            "BFS produced {} nodes, fewer than {routing_root_nodes} routing roots",
+            bfs_nodes.len()
+        )));
+    }
+
+    let bfs_target = requested_bfs_nodes
+        .max(routing_root_nodes)
+        .min(cache_budget);
+    let mut selected = Vec::with_capacity(cache_budget);
+    let mut seen = HashSet::with_capacity(cache_budget);
+
+    for &node in bfs_nodes.iter().take(bfs_target) {
+        if seen.insert(node) {
+            selected.push(node);
+        }
+    }
+    let actual_bfs_nodes = selected.len();
+
+    let mut frequency_count = 0usize;
+    for &node in frequency_nodes {
+        if selected.len() == cache_budget {
+            break;
+        }
+        if seen.insert(node) {
+            selected.push(node);
+            frequency_count += 1;
+        }
+    }
+
+    let mut fallback_bfs_nodes = 0usize;
+    for &node in bfs_nodes {
+        if selected.len() == cache_budget {
+            break;
+        }
+        if seen.insert(node) {
+            selected.push(node);
+            fallback_bfs_nodes += 1;
+        }
+    }
+
+    if selected.len() != cache_budget {
+        return Err(ANNError::log_index_error(format!(
+            "hybrid cache composition produced {} unique nodes, expected {cache_budget}",
+            selected.len()
+        )));
+    }
+    let estimated_payload_bytes = node_len
+        .checked_mul(selected.len() as u64)
+        .ok_or_else(|| ANNError::log_index_error("hybrid cache payload size overflow"))?;
+
+    Ok((
+        selected,
+        HybridCacheComposition {
+            requested_bfs_nodes,
+            routing_root_nodes,
+            bfs_nodes: actual_bfs_nodes,
+            frequency_nodes: frequency_count,
+            fallback_bfs_nodes,
+            total_nodes: cache_budget,
+            estimated_payload_bytes,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -418,6 +647,120 @@ pub(crate) mod tests {
         assert!(cache.contains(&3));
         assert!(cache.contains(&20));
         assert!(!cache.contains(&9));
+    }
+
+    #[test]
+    fn test_hybrid_composition_deduplicates_and_uses_fallback() {
+        let (nodes, composition) =
+            compose_hybrid_cache_nodes(&[10, 20, 30, 40, 50], &[20, 60], 5, 2, 1, 100).unwrap();
+
+        assert_eq!(nodes, [10, 20, 60, 30, 40]);
+        assert_eq!(
+            composition,
+            HybridCacheComposition {
+                requested_bfs_nodes: 2,
+                routing_root_nodes: 1,
+                bfs_nodes: 2,
+                frequency_nodes: 1,
+                fallback_bfs_nodes: 2,
+                total_nodes: 5,
+                estimated_payload_bytes: 500,
+            }
+        );
+    }
+
+    #[test]
+    fn test_hybrid_composition_preserves_roots_at_zero_bfs_fraction() {
+        let (nodes, composition) =
+            compose_hybrid_cache_nodes(&[10, 20, 30, 40], &[30, 50, 60], 4, 0, 2, 1).unwrap();
+
+        assert_eq!(nodes, [10, 20, 30, 50]);
+        assert_eq!(composition.bfs_nodes, 2);
+        assert_eq!(composition.frequency_nodes, 2);
+        assert_eq!(composition.fallback_bfs_nodes, 0);
+    }
+
+    #[test]
+    fn test_hybrid_composition_honors_full_bfs_endpoint() {
+        let (nodes, composition) =
+            compose_hybrid_cache_nodes(&[10, 20, 30], &[40, 50], 3, 3, 1, 1).unwrap();
+
+        assert_eq!(nodes, [10, 20, 30]);
+        assert_eq!(composition.bfs_nodes, 3);
+        assert_eq!(composition.frequency_nodes, 0);
+        assert_eq!(composition.fallback_bfs_nodes, 0);
+    }
+
+    #[test]
+    fn test_hybrid_composition_rejects_budget_smaller_than_roots() {
+        let error = compose_hybrid_cache_nodes(&[10, 20], &[30], 1, 0, 2, 1).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot preserve 2 routing roots"));
+    }
+
+    #[test]
+    fn test_hybrid_cache_rejects_budget_larger_than_graph() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let mut factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider),
+            CachingStrategy::None,
+        )
+        .unwrap();
+
+        let error = factory
+            .seed_cache_from_hybrid_nodes(&[0], &[], 257, 128)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cache budget 257 exceeds graph point count 256"));
+    }
+
+    #[test]
+    fn test_collect_nodes_via_bfs_matches_cached_adjacency_order() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider.clone()),
+            CachingStrategy::None,
+        )
+        .unwrap();
+        let start_node = factory.get_header().unwrap().metadata().medoid as u32;
+        let actual = factory.collect_nodes_via_bfs(&[start_node], 10).unwrap();
+
+        let fully_cached = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider),
+            CachingStrategy::StaticCacheWithBfsNodes(256),
+        )
+        .unwrap();
+        let cache = fully_cached.cache.as_ref().unwrap();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([start_node]);
+        let mut expected = Vec::new();
+        visited.insert(start_node);
+        while let Some(node) = queue.pop_front() {
+            expected.push(node);
+            if expected.len() == 10 {
+                break;
+            }
+            for &neighbor in cache.get_adjacency_list(&node).unwrap().iter() {
+                if visited.insert(neighbor) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
