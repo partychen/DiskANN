@@ -19,7 +19,7 @@ use tracing::info;
 
 use crate::{
     error::{diskann_error, ErrorKind},
-    storage::quant::compressor::QuantCompressor,
+    storage::quant::compressor::{Compress, QuantCompressor},
 };
 
 pub struct PQGenerationContext<'a, Storage>
@@ -38,25 +38,41 @@ where
     pub num_centers: usize,
 }
 
+/// Describes how to obtain a PQ codebook. Construction is cheap; the actual work happens in
+/// [`QuantCompressor::prepare`].
 pub struct PQGeneration<'a, T, Storage>
 where
     T: VectorRepr,
     Storage: StorageReadProvider + StorageWriteProvider + 'a,
 {
-    table: TransposedTable,
-    num_chunks: usize,
+    context: &'a PQGenerationContext<'a, Storage>,
     phantom_data: PhantomData<T>,
-    phantom_storage: PhantomData<&'a Storage>,
 }
 
-impl<'a, T, Storage> QuantCompressor<T> for PQGeneration<'a, T, Storage>
+/// A PQ codebook that is ready to compress vectors.
+pub struct PQCompressor {
+    table: TransposedTable,
+    num_chunks: usize,
+}
+
+impl<'a, T, Storage> QuantCompressor<'a, T> for PQGeneration<'a, T, Storage>
 where
     T: VectorRepr,
     Storage: StorageReadProvider + StorageWriteProvider + 'a,
 {
     type CompressorContext = PQGenerationContext<'a, Storage>;
+    type Prepared = PQCompressor;
 
-    fn new(context: &Self::CompressorContext) -> diskann::ANNResult<Self> {
+    fn new(context: &'a Self::CompressorContext) -> Self {
+        Self {
+            context,
+            phantom_data: PhantomData,
+        }
+    }
+
+    fn prepare(&self) -> diskann::ANNResult<Self::Prepared> {
+        let context = self.context;
+
         // validate that the number of chunks is correct.
         if context.num_chunks > context.dim {
             return Err(diskann_error!(
@@ -133,14 +149,11 @@ where
             TransposedTable::from_parts(table.view_pivots(), table.view_offsets().to_owned())
                 .map_err(|err| diskann_error!(ErrorKind::PQError, "{}", Format(err)))?;
 
-        Ok(Self {
-            table,
-            num_chunks,
-            phantom_data: PhantomData,
-            phantom_storage: PhantomData,
-        })
+        Ok(PQCompressor { table, num_chunks })
     }
+}
 
+impl Compress for PQCompressor {
     fn compress(
         &self,
         vector: MatrixBase<&[f32]>,
@@ -178,8 +191,8 @@ mod pq_generation_tests {
     use rstest::rstest;
     use vfs::FileSystem;
 
-    use super::{PQGeneration, PQGenerationContext};
-    use crate::storage::quant::compressor::QuantCompressor;
+    use super::{PQCompressor, PQGeneration, PQGenerationContext};
+    use crate::storage::quant::compressor::{Compress, QuantCompressor};
 
     const TEST_PQ_DATA_PATH: &str = "/sift/siftsmall_learn.bin";
     const TEST_PQ_PIVOTS_PATH: &str = "/sift/siftsmall_learn_pq_pivots.bin";
@@ -203,7 +216,7 @@ mod pq_generation_tests {
         pivots_path: String,
         compressed_path: String,
         data_path: Option<&str>,
-    ) -> Result<PQGeneration<'a, f32, VirtualStorageProvider<F>>, ANNError> {
+    ) -> Result<PQCompressor, ANNError> {
         let pq_storage = PQStorage::new(&pivots_path, &compressed_path, data_path);
         let context = PQGenerationContext::<'_, _> {
             pq_storage,
@@ -217,7 +230,7 @@ mod pq_generation_tests {
             metric: Metric::L2,
             dim,
         };
-        PQGeneration::<_, _>::new(&context)
+        PQGeneration::<f32, _>::new(&context).prepare()
     }
 
     #[rstest]
