@@ -205,6 +205,34 @@ mod pq_generation_tests {
         100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32,
     ];
     #[allow(clippy::too_many_arguments)]
+    fn create_context<'a, F: vfs::FileSystem>(
+        provider: &'a VirtualStorageProvider<F>,
+        dim: usize,
+        num_chunks: usize,
+        max_kmeans_reps: usize,
+        num_centers: usize,
+        p_val: f64,
+        pool: RayonThreadPoolRef<'a>,
+        pivots_path: String,
+        compressed_path: String,
+        data_path: Option<&str>,
+    ) -> PQGenerationContext<'a, VirtualStorageProvider<F>> {
+        let pq_storage = PQStorage::new(&pivots_path, &compressed_path, data_path);
+        PQGenerationContext::<'_, _> {
+            pq_storage,
+            num_chunks,
+            num_centers,
+            seed: Some(42),
+            p_val,
+            max_kmeans_reps,
+            storage_provider: provider,
+            pool,
+            metric: Metric::L2,
+            dim,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_new_compressor<'a, F: vfs::FileSystem>(
         provider: &'a VirtualStorageProvider<F>,
         dim: usize,
@@ -217,20 +245,72 @@ mod pq_generation_tests {
         compressed_path: String,
         data_path: Option<&str>,
     ) -> Result<PQCompressor, ANNError> {
-        let pq_storage = PQStorage::new(&pivots_path, &compressed_path, data_path);
-        let context = PQGenerationContext::<'_, _> {
-            pq_storage,
-            num_chunks,
-            num_centers,
-            seed: Some(42),
-            p_val,
-            max_kmeans_reps,
-            storage_provider: provider,
-            pool,
-            metric: Metric::L2,
+        let context = create_context(
+            provider,
             dim,
-        };
+            num_chunks,
+            max_kmeans_reps,
+            num_centers,
+            p_val,
+            pool,
+            pivots_path,
+            compressed_path,
+            data_path,
+        );
         PQGeneration::<f32, _>::new(&context).prepare()
+    }
+
+    /// Constructing a [`PQGeneration`] must not touch storage: the pivots file only appears
+    /// once [`QuantCompressor::prepare`] is called.
+    #[rstest]
+    fn new_is_side_effect_free_and_prepare_creates_pivots() {
+        let storage_provider = VirtualStorageProvider::new_memory();
+        storage_provider
+            .filesystem()
+            .create_dir("/pq_generation_tests")
+            .expect("Could not create test directory");
+
+        let pivot_file_name = "/pq_generation_tests/lazy_pivots_test.bin";
+        let compressed_file_name = "/pq_generation_tests/lazy_compressed_not_used.bin";
+        let data_path = "/pq_generation_tests/lazy_data_path.bin";
+
+        let (ndata, dim, num_centers, num_chunks, max_k_means_reps) = (5, 8, 2, 2, 5);
+
+        write_bin(
+            MatrixView::try_from(VALIDATION_DATA.as_slice(), ndata, dim).unwrap(),
+            &mut storage_provider.create_for_write(data_path).unwrap(),
+        )
+        .unwrap();
+
+        let pool = create_thread_pool_for_test();
+        let context = create_context(
+            &storage_provider,
+            dim,
+            num_chunks,
+            max_k_means_reps,
+            num_centers,
+            1.0, //take all the data to compute codebook
+            pool.as_ref(),
+            pivot_file_name.to_string(),
+            compressed_file_name.to_string(),
+            Some(data_path),
+        );
+
+        assert!(!storage_provider.exists(pivot_file_name));
+
+        let generator = PQGeneration::<f32, _>::new(&context);
+        assert!(
+            !storage_provider.exists(pivot_file_name),
+            "constructing the generator must not write pivots"
+        );
+
+        let compressor = generator.prepare().unwrap();
+        assert!(storage_provider.exists(pivot_file_name));
+
+        assert_eq!(compressor.compressed_bytes(), num_chunks);
+        assert_eq!(compressor.table.dim(), dim);
+        assert_eq!(compressor.table.ncenters(), num_centers);
+        assert_eq!(compressor.table.nchunks(), num_chunks);
     }
 
     #[rstest]
