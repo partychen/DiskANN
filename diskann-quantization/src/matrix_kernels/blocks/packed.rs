@@ -38,11 +38,13 @@ impl<'a, T, const SZ: usize> View<'a, T, SZ> {
     /// The mapping of parameters is as follows:
     ///
     /// * The group size `SZ` is taken from the `GROUP` const-generic on [`BlockTransposedRef`].
-    /// * The number of groups in each block is [`BlockTransposedRef::ncols`].
+    /// * The number of groups in each block is [`BlockTransposedRef::padded_ncols`].
     /// * The number of blocks is [`BlockTransposedRef::num_blocks`].
     ///
     /// Returns `None` if any of the runtime values is zero.
-    pub(crate) fn from_block_transposed(v: BlockTransposedRef<'a, T, SZ>) -> Option<Self>
+    pub(crate) fn from_block_transposed<const PACK: usize>(
+        v: BlockTransposedRef<'a, T, SZ, PACK>,
+    ) -> Option<Self>
     where
         T: Copy,
     {
@@ -51,7 +53,7 @@ impl<'a, T, const SZ: usize> View<'a, T, SZ> {
         }
 
         let blocks = NonZeroUsize::new(v.num_blocks())?;
-        let k = DimK::new(NonZeroUsize::new(v.ncols())?);
+        let k = DimK::new(NonZeroUsize::new(v.padded_ncols())?);
 
         // SAFETY: `BlockTransposedRef` ensures the underlying slice has a length of
         // exactly `SZ * blocks * k`.
