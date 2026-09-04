@@ -95,6 +95,53 @@ macro_rules! impl_loadstore {
 }
 
 #[cfg(target_arch = "x86_64")]
+macro_rules! impl_loadstore_pair {
+    ($T:ty, $N:literal, $HALF:literal, $wide:ident, $arch:ty) => {
+        impl LoadStore<$T, $N> for $arch {
+            #[inline(always)]
+            fn load(self, src: &[$T]) -> [$T; $N] {
+                use diskann_wide::{LoHi, SIMDVector};
+                diskann_wide::alias!(wide = <$arch>::$wide);
+
+                // SAFETY: Loading the first `src.len().min(HALF)` elements is valid.
+                let lo = unsafe { wide::load_simd_first(self, src.as_ptr(), src.len()) }.to_array();
+
+                // SAFETY: This only reads the remainder when `src.len()` exceeds `HALF`.
+                let hi = unsafe {
+                    wide::load_simd_first(
+                        self,
+                        src.as_ptr().wrapping_add($HALF),
+                        src.len().saturating_sub($HALF),
+                    )
+                }
+                .to_array();
+
+                LoHi::new(lo, hi).join()
+            }
+
+            #[inline(always)]
+            fn store(self, v: [$T; $N], dst: &mut [$T]) {
+                use diskann_wide::{LoHi, SIMDVector, SplitJoin};
+                diskann_wide::alias!(wide = <$arch>::$wide);
+
+                let LoHi { lo, hi } = v.split();
+
+                // SAFETY: Storing the first `dst.len().min(HALF)` elements is valid.
+                unsafe { wide::from_array(self, lo).store_simd_first(dst.as_mut_ptr(), dst.len()) };
+
+                if let Some(rest) = dst.len().checked_sub($HALF) {
+                    // SAFETY: This only writes the remainder when `dst.len()` exceeds `HALF`.
+                    unsafe {
+                        wide::from_array(self, hi)
+                            .store_simd_first(dst.as_mut_ptr().add($HALF), rest)
+                    };
+                }
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use super::*;
 
@@ -102,50 +149,14 @@ mod x86_64 {
 
     impl_loadstore!(f32, 8, f32x8, V3);
     impl_loadstore!(f32, 16, f32x16, V3);
+    impl_loadstore!(u32, 16, u32x16, V3);
 
     impl_loadstore!(f32, 8, f32x8, V4);
     impl_loadstore!(f32, 16, f32x16, V4);
+    impl_loadstore!(u32, 16, u32x16, V4);
 
-    impl LoadStore<f32, 32> for V4 {
-        #[inline(always)]
-        fn load(self, src: &[f32]) -> [f32; 32] {
-            use diskann_wide::{LoHi, SIMDVector};
-            diskann_wide::alias!(wide = <V4>::f32x16);
-
-            // SAFETY: Loading the first `src.len().min(16)` elements from `src` is valid.
-            let lo = unsafe { wide::load_simd_first(self, src.as_ptr(), src.len()) }.to_array();
-
-            // SAFETY: This only reads `src.len() - 16` values if `src.len()` exceeds 16.
-            let hi = unsafe {
-                wide::load_simd_first(
-                    self,
-                    src.as_ptr().wrapping_offset(16),
-                    src.len().saturating_sub(16),
-                )
-            }
-            .to_array();
-
-            LoHi::new(lo, hi).join()
-        }
-
-        #[inline(always)]
-        fn store(self, v: [f32; 32], dst: &mut [f32]) {
-            use diskann_wide::{LoHi, SIMDVector, SplitJoin};
-            diskann_wide::alias!(wide = <V4>::f32x16);
-
-            let LoHi { lo, hi } = v.split();
-
-            // SAFETY: Storing the first `dst.len().min(16)` elements to `dst` is valid.
-            unsafe { wide::from_array(self, lo).store_simd_first(dst.as_mut_ptr(), dst.len()) };
-
-            if let Some(rest) = dst.len().checked_sub(16) {
-                // SAFETY: This only writes if `dst.len() - 16` values if `dst.len()` exceeds 16.
-                unsafe {
-                    wide::from_array(self, hi).store_simd_first(dst.as_mut_ptr().add(16), rest)
-                };
-            }
-        }
-    }
+    impl_loadstore_pair!(f32, 32, 16, f32x16, V4);
+    impl_loadstore_pair!(u32, 32, 16, u32x16, V4);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -157,6 +168,7 @@ mod aarch64 {
     impl_loadstore!(f32, 4, f32x4, Neon);
     impl_loadstore!(f32, 8, f32x8, Neon);
     impl_loadstore!(f32, 16, f32x16, Neon);
+    impl_loadstore!(u32, 8, u32x8, Neon);
 }
 
 //////////

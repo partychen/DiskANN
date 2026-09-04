@@ -20,7 +20,7 @@ use crate::matrix_kernels::{
     util::{self, Convert, Converter},
 };
 
-use super::packed_f32_x_unpacked_f32::{PanelKernel, Params};
+use super::{Params, packed_f32_x_unpacked_f32::PanelKernel};
 
 /// A driver for prepacked by unpacked "maxsim" computations.
 ///

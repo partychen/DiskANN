@@ -16,6 +16,7 @@
 //!
 //! There is plenty of room for improvement. This is just a starting point.
 
+#[cfg(test)]
 use std::num::NonZeroUsize;
 
 use diskann_wide::{
@@ -27,41 +28,12 @@ use crate::matrix_kernels::{
     Cache,
     blocks::{packed, unpacked},
     bounds, driver,
-    num::{Bytes, DimK, Elements, value_or_one},
+    num::{DimK, Elements},
     ptr::{MutSlice, Slice},
     util::{self, Fold, Folder},
 };
 
-/// Blocking parameters for the `packed x unpacked` kernel.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Params {
-    /// The (approximate) number of blocks of `A` that fit in the L2 cache.
-    pub(super) a_panels_in_l2: NonZeroUsize,
-    /// The (approximate) number of columns of `B` that fis in the L1 cache.
-    pub(super) b_cols_in_l1: NonZeroUsize,
-}
-
-impl Params {
-    /// Select hyper-parameters for the `packed x unpacked` kernel based on cache size.
-    pub(super) fn new(cache: Cache, a_panel: Bytes, b_col: Bytes, nr: usize) -> Self {
-        // Pick the number of A-panels to process at a time so the working set is within
-        // the L2 cache.
-        let a_panels_in_l2 = value_or_one(cache.l2().get() / a_panel.value());
-
-        // Pick the number of B-panels to process to the `B` working set plus a single
-        // panel of `A` fits in the L1 cache.
-        //
-        // Make sure we process at least one B-panel at a time. Otherwise performance falls
-        // off a cliff.
-        let b_budget = cache.l1().get().saturating_sub(a_panel.value()).max(1);
-        let b_cols_in_l1 = value_or_one(nr * (b_budget.div_ceil(nr * b_col.value())));
-
-        Self {
-            a_panels_in_l2,
-            b_cols_in_l1,
-        }
-    }
-}
+use super::Params;
 
 //--------//
 // Driver //
