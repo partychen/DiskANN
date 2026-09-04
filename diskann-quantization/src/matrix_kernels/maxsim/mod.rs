@@ -18,6 +18,8 @@
 
 pub(crate) mod packed_f32_x_unpacked_f16;
 pub(crate) mod packed_f32_x_unpacked_f32;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod packed_u8_x_unpacked_u4;
 
 #[cfg(test)]
 mod test;

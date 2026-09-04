@@ -9,7 +9,7 @@
 //!
 //! * Proper run time cache-size detection.
 //! * GEMM-like kernels beyond "maxsim".
-//! * Quantization correction and public integration.
+//! * Quantization support.
 //! * Blocking along the contraction dimension "k".
 //! * Comprehensive performance tuning.
 //!
@@ -31,10 +31,6 @@
 use std::num::NonZeroUsize;
 
 // Kernels
-// This raw kernel is intentionally not wired into quantized MaxSim until the correction
-// boundary is defined in the follow-up.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) mod integer;
 pub(crate) mod maxsim;
 
 // Arguments

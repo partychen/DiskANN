@@ -201,6 +201,42 @@ impl<'a, T, const SZ: usize> View<'a, T, SZ> {
     }
 }
 
+impl<'a, const SZ: usize> View<'a, [u8; 2], SZ> {
+    /// Construct a paired-element view from a 2-way packed [`BlockTransposedRef`].
+    ///
+    /// Returns `None` if either dimension is zero or the second lane of an odd trailing
+    /// column pair is not zero-padded.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_u8_pairs(v: BlockTransposedRef<'a, u8, SZ, 2>) -> Option<Self> {
+        if SZ == 0 {
+            return None;
+        }
+
+        let blocks = NonZeroUsize::new(v.num_blocks())?;
+        let k = DimK::new(NonZeroUsize::new(v.padded_ncols() / 2)?);
+        let block_stride = SZ * v.padded_ncols();
+
+        if !v.ncols().is_multiple_of(2)
+            && v.as_slice().chunks_exact(block_stride).any(|block| {
+                block[block_stride - 2 * SZ..]
+                    .chunks_exact(2)
+                    .any(|pair| pair[1] != 0)
+            })
+        {
+            return None;
+        }
+
+        let len = v.as_slice().len() / 2;
+
+        // SAFETY: `[u8; 2]` has the same alignment as `u8`. The 2-way packed layout and its
+        // padded column count guarantee that the backing slice contains an even number of bytes.
+        let pairs = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<[u8; 2]>(), len) };
+
+        // SAFETY: The backing slice contains exactly `SZ * blocks * k` pairs.
+        Some(unsafe { Self::new(Slice::new(pairs), blocks, k) })
+    }
+}
+
 #[cfg(test)]
 impl<'a, T, const SZ: usize> View<'a, T, SZ> {
     fn checked_visit_sub_views<F>(&self, sub_blocks: NonZeroUsize, f: F)
