@@ -9,7 +9,7 @@
 //!
 //! * Proper run time cache-size detection.
 //! * GEMM-like kernels beyond "maxsim".
-//! * Quantization support.
+//! * Quantization correction and public integration.
 //! * Blocking along the contraction dimension "k".
 //! * Comprehensive performance tuning.
 //!
