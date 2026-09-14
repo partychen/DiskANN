@@ -6,7 +6,105 @@
 // x86 intrinsics
 use std::arch::x86_64::*;
 
-use super::V3;
+use crate::SIMDVector;
+
+use super::{V3, V4, v3, v4};
+
+/// Expand the four unsigned nibbles in `packed`, least significant first, and repeat
+/// the resulting four bytes across the vector. Each output lane is in `0..=15`.
+#[inline(always)]
+pub fn splat_u4x4(arch: V3, packed: u16) -> v3::i8x32 {
+    if cfg!(miri) {
+        v3::i8x32::from_array(
+            arch,
+            core::array::from_fn(|i| ((packed >> (4 * (i % 4))) & 0x0f) as i8),
+        )
+    } else {
+        let packed = v3::i16x16::splat(arch, packed as i16).to_underlying();
+        let mask = v3::i8x32::splat(arch, 0x0f);
+        let low = v3::i8x32::from_underlying(arch, packed) & mask;
+        // SAFETY: V3 provides AVX2.
+        unsafe {
+            let high = v3::i8x32::from_underlying(arch, _mm256_srli_epi16::<4>(packed)) & mask;
+            v3::i8x32::from_underlying(
+                arch,
+                _mm256_unpacklo_epi8(low.to_underlying(), high.to_underlying()),
+            )
+        }
+    }
+}
+
+/// Multiply unsigned bytes by signed bytes, add adjacent products, and saturate
+/// each sum to `i16`. Output lane `i` uses input lanes `2 * i` and `2 * i + 1`.
+///
+/// Unlike [`crate::SIMDDotProduct`], this operation saturates before any wider accumulation.
+#[inline(always)]
+pub fn multiply_sum_saturating_u8x32_i8x32(a: v3::u8x32, b: v3::i8x32) -> v3::i16x16 {
+    let arch = a.arch();
+    if cfg!(miri) {
+        let a = a.to_array();
+        let b = b.to_array();
+        v3::i16x16::from_array(
+            arch,
+            core::array::from_fn(|i| {
+                let x0 = i32::from(a[2 * i]) * i32::from(b[2 * i]);
+                let x1 = i32::from(a[2 * i + 1]) * i32::from(b[2 * i + 1]);
+                (x0 + x1).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+            }),
+        )
+    } else {
+        // SAFETY: The input vectors imply V3, which provides AVX2.
+        v3::i16x16::from_underlying(arch, unsafe {
+            _mm256_maddubs_epi16(a.to_underlying(), b.to_underlying())
+        })
+    }
+}
+
+/// Expand the eight unsigned nibbles in `packed`, least significant first, and repeat
+/// the resulting eight bytes across the vector. Each output lane is in `0..=15`.
+///
+/// Uses BMI2 bit deposit followed by a 512-bit broadcast.
+#[inline(always)]
+pub fn splat_u4x8(arch: V4, packed: u32) -> v4::i8x64 {
+    #[cfg(miri)]
+    {
+        v4::i8x64::from_array(
+            arch,
+            core::array::from_fn(|i| ((packed >> (4 * (i % 8))) & 0x0f) as i8),
+        )
+    }
+    #[cfg(not(miri))]
+    {
+        // SAFETY: V4 includes BMI2.
+        let expanded = unsafe { _pdep_u64(u64::from(packed), 0x0f0f_0f0f_0f0f_0f0f) };
+        v4::i8x64::from_underlying(arch, v4::u64x8::splat(arch, expanded).to_underlying())
+    }
+}
+
+/// Sum adjacent `i32` lanes with wrapping arithmetic.
+///
+/// Output lane `i` is `values[2 * i].wrapping_add(values[2 * i + 1])`.
+#[inline(always)]
+pub fn sum_adjacent_i32x16(values: v4::i32x16) -> v4::i32x8 {
+    let arch = values.arch();
+    #[cfg(miri)]
+    {
+        let values = values.to_array();
+        v4::i32x8::from_array(
+            arch,
+            core::array::from_fn(|i| values[2 * i].wrapping_add(values[2 * i + 1])),
+        )
+    }
+    #[cfg(not(miri))]
+    {
+        let upper = v4::u64x8::from_underlying(arch, values.to_underlying()) >> 32;
+        let pairs = values + v4::i32x16::from_underlying(arch, upper.to_underlying());
+        // SAFETY: The input vector implies V4, which provides AVX-512F.
+        v4::i32x8::from_underlying(arch, unsafe {
+            _mm512_cvtepi64_epi32(pairs.to_underlying())
+        })
+    }
+}
 
 /// Efficiently load the first `8 < bytes < 16` bytes from `ptr` without accessing memory
 /// outside of `[ptr, ptr + bytes)`.
@@ -160,5 +258,105 @@ pub(crate) unsafe fn __load_first_u16_of_16_bytes(
         } else {
             _mm_setzero_si128()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::driver;
+
+    fn test_v4() -> Option<V4> {
+        if cfg!(miri) {
+            V4::new_checked_miri()
+        } else {
+            V4::new_checked_uncached()
+        }
+    }
+
+    #[test]
+    fn test_splat_u4x4() {
+        let Some(arch) = V3::new_checked_uncached() else {
+            return;
+        };
+        let check = move |input: &[u16]| {
+            let bytes = input[0].to_le_bytes();
+            let expected = bytes.map(|b| [b & 0x0f, b >> 4]);
+            let got = splat_u4x4(arch, input[0]).to_array();
+            for (i, lane) in got.into_iter().enumerate() {
+                assert_eq!(lane, expected[(i % 4) / 2][i % 2] as i8);
+            }
+        };
+        driver::drive_unary(&check, 1, 0xe60aa814);
+        for lane in 0..4 {
+            for nibble in 0..=15 {
+                check(&[nibble << (4 * lane)]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiply_sum_saturating_u8x32_i8x32() {
+        let Some(arch) = V3::new_checked_uncached() else {
+            return;
+        };
+        let check = move |a: &[u8], b: &[i8]| {
+            let expected: [i16; 16] = core::array::from_fn(|i| {
+                let sum = (0..2)
+                    .map(|j| i32::from(a[2 * i + j]) * i32::from(b[2 * i + j]))
+                    .sum::<i32>();
+                sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+            });
+            let a = v3::u8x32::from_array(arch, a.try_into().unwrap());
+            let b = v3::i8x32::from_array(arch, b.try_into().unwrap());
+            assert_eq!(
+                multiply_sum_saturating_u8x32_i8x32(a, b).to_array(),
+                expected
+            );
+        };
+        driver::drive_binary(&check, (32, 32), 0x67b693ff);
+        check(&[255; 32], &[127; 32]);
+        check(&[255; 32], &[-128; 32]);
+        check(&[255; 32], &[15; 32]);
+    }
+
+    #[test]
+    fn test_splat_u4x8() {
+        let Some(arch) = test_v4() else {
+            return;
+        };
+        let check = move |input: &[u32]| {
+            let bytes = input[0].to_le_bytes();
+            let expected = bytes.map(|b| [b & 0x0f, b >> 4]);
+            let got = splat_u4x8(arch, input[0]).to_array();
+            for (i, lane) in got.into_iter().enumerate() {
+                assert_eq!(lane, expected[(i % 8) / 2][i % 2] as i8);
+            }
+        };
+        driver::drive_unary(&check, 1, 0x9578d17b);
+        for lane in 0..8 {
+            for nibble in 0..=15 {
+                check(&[nibble << (4 * lane)]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sum_adjacent_i32x16() {
+        let Some(arch) = test_v4() else {
+            return;
+        };
+        let check = move |input: &[i32]| {
+            let expected: [i32; 8] =
+                core::array::from_fn(|i| input[2 * i].wrapping_add(input[2 * i + 1]));
+            let values = v4::i32x16::from_array(arch, input.try_into().unwrap());
+            assert_eq!(sum_adjacent_i32x16(values).to_array(), expected);
+        };
+        driver::drive_unary(&check, 16, 0xf7d2c381);
+        check(&[i32::MAX; 16]);
+        check(&[i32::MIN; 16]);
+        check(&core::array::from_fn::<_, 16, _>(|i| {
+            if i % 2 == 0 { i32::MAX } else { 1 }
+        }));
     }
 }

@@ -4,8 +4,8 @@
  */
 
 use crate::{
-    Emulated, SIMDDotProduct, SIMDMask, SIMDMulAdd, SIMDPartialEq, SIMDPartialOrd, SIMDSelect,
-    SIMDSumTree, SIMDVector, constant::Const, helpers,
+    Emulated, SIMDDotProduct, SIMDMask, SIMDMulAdd, SIMDPartialEq, SIMDPartialOrd, SIMDReinterpret,
+    SIMDSelect, SIMDSumTree, SIMDVector, constant::Const, helpers,
 };
 
 // AArch64 masks
@@ -78,6 +78,19 @@ impl SIMDSelect<u32x4> for mask32x4 {
     }
 }
 
+impl SIMDReinterpret<u8x16> for u32x4 {
+    #[inline(always)]
+    fn reinterpret_simd(self) -> u8x16 {
+        if cfg!(miri) {
+            let bytes = self.to_array().map(u32::to_ne_bytes);
+            u8x16::from_array(self.arch(), core::array::from_fn(|i| bytes[i / 4][i % 4]))
+        } else {
+            // SAFETY: The input vector implies Neon; reinterpreting preserves all bits.
+            u8x16::from_underlying(self.arch(), unsafe { vreinterpretq_u8_u32(self.0) })
+        }
+    }
+}
+
 impl SIMDDotProduct<u8x16, u8x16> for u32x4 {
     #[inline(always)]
     fn dot_simd(self, left: u8x16, right: u8x16) -> Self {
@@ -143,6 +156,20 @@ mod tests {
         if let Some(arch) = test_neon() {
             test_utils::ops::test_splat::<u32, 4, u32x4>(arch);
         }
+    }
+
+    #[test]
+    fn test_reinterpret_u8x16() {
+        let Some(arch) = test_neon() else {
+            return;
+        };
+        let check = move |input: &[u32]| {
+            let input: [u32; 4] = input.try_into().unwrap();
+            let got: u8x16 = u32x4::from_array(arch, input).reinterpret_simd();
+            let expected: Vec<u8> = input.into_iter().flat_map(u32::to_ne_bytes).collect();
+            assert_eq!(got.to_array().as_slice(), expected);
+        };
+        test_utils::driver::drive_unary(&check, 4, 0xbfa69043);
     }
 
     // Ops

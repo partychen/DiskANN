@@ -320,6 +320,7 @@ macro_rules! micro_kernel {
 }
 
 #[inline(always)]
+#[cfg(any(target_arch = "aarch64", test))]
 unsafe fn expand_full_u4(values: Slice<'_, u8>, chunk: usize) -> u32 {
     // SAFETY: A full chunk contains two packed MinMax4 bytes.
     let packed = unsafe {
@@ -560,19 +561,14 @@ mod x86_64 {
     use super::*;
 
     use diskann_wide::SIMDVector;
-    use diskann_wide::arch::x86_64::{V3, V4};
+    use diskann_wide::arch::x86_64::{V3, V4, algorithms};
 
     #[inline(always)]
-    unsafe fn unpack_full_u4_avx2(
+    unsafe fn unpack_full_u4(
         arch: V3,
         values: Slice<'_, u8>,
         byte_offset: usize,
     ) -> <V3 as Architecture>::i8x32 {
-        // wide does not expose 16-bit logical shifts or this byte interleave.
-        use std::arch::x86_64::{_mm256_srli_epi16, _mm256_unpacklo_epi8};
-        diskann_wide::alias!(i16s = <V3>::i16x16);
-        diskann_wide::alias!(i8s = <V3>::i8x32);
-
         // SAFETY: A full group contains two packed MinMax4 bytes.
         let packed = unsafe {
             values
@@ -583,17 +579,7 @@ mod x86_64 {
         let first = unsafe { *packed.as_unit().as_ref() };
         // SAFETY: The second byte is within the tracked two-byte span.
         let second = unsafe { *packed.add(Elements::new(1)).as_unit().as_ref() };
-        let packed = i16s::splat(arch, i16::from_le_bytes([first, second])).to_underlying();
-        let mask = i8s::splat(arch, 0x0f);
-        let low = i8s::from_underlying(arch, packed) & mask;
-        // SAFETY: V3 provides AVX2.
-        unsafe {
-            let high = i8s::from_underlying(arch, _mm256_srli_epi16::<4>(packed)) & mask;
-            i8s::from_underlying(
-                arch,
-                _mm256_unpacklo_epi8(low.to_underlying(), high.to_underlying()),
-            )
-        }
+        algorithms::splat_u4x4(arch, u16::from_le_bytes([first, second]))
     }
 
     panel_kernel!(V3, 16, 8, [1, 2, 3, 4, 5, 6, 7]);
@@ -617,18 +603,13 @@ mod x86_64 {
             diskann_wide::alias!(i8s = <V3>::i8x32);
             diskann_wide::alias!(u32s = <V3>::u32x8);
 
-            if dimensions == 4 && !cfg!(miri) {
-                // SAFETY: Four dimensions occupy two packed bytes, and V3 provides AVX2.
-                return unsafe { unpack_full_u4_avx2(self, values, byte_offset) };
+            if dimensions == 4 {
+                // SAFETY: Four dimensions occupy two packed bytes.
+                return unsafe { unpack_full_u4(self, values, byte_offset) };
             }
 
-            let expanded = if dimensions == 4 {
-                // SAFETY: Four dimensions occupy two packed bytes.
-                unsafe { expand_full_u4(values, byte_offset / 2) }
-            } else {
-                // SAFETY: Inherited from the trait contract.
-                unsafe { expand_tail_u4(values, byte_offset, dimensions) }
-            };
+            // SAFETY: Inherited from the trait contract.
+            let expanded = unsafe { expand_tail_u4(values, byte_offset, dimensions) };
             if cfg!(miri) {
                 let bytes = expanded.to_le_bytes();
                 i8s::from_array(self, core::array::from_fn(|i| bytes[i % 4] as i8))
@@ -639,28 +620,9 @@ mod x86_64 {
 
         fn dot(self, accumulator: Self::Accumulator, a: Self::A, b: Self::B) -> Self::Accumulator {
             use diskann_wide::SIMDDotProduct;
-            // wide exposes the i16 dot product, but not the mixed-byte pair product.
-            use std::arch::x86_64::_mm256_maddubs_epi16;
             diskann_wide::alias!(i16s = <V3>::i16x16);
 
-            let products = if cfg!(miri) {
-                let a = a.to_array();
-                let b = b.to_array();
-                i16s::from_array(
-                    self,
-                    core::array::from_fn(|i| {
-                        let x0 = i32::from(a[2 * i]) * i32::from(b[2 * i]);
-                        let x1 = i32::from(a[2 * i + 1]) * i32::from(b[2 * i + 1]);
-                        (x0 + x1).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
-                    }),
-                )
-            } else {
-                i16s::from_underlying(
-                    self,
-                    // SAFETY: V3 provides AVX2.
-                    unsafe { _mm256_maddubs_epi16(a.to_underlying(), b.to_underlying()) },
-                )
-            };
+            let products = algorithms::multiply_sum_saturating_u8x32_i8x32(a, b);
             accumulator.dot_simd(products, i16s::splat(self, 1))
         }
 
@@ -684,64 +646,26 @@ mod x86_64 {
             byte_offset: usize,
             dimensions: usize,
         ) -> Self::B {
-            diskann_wide::alias!(i8s = <V4>::i8x64);
-
-            #[cfg(miri)]
-            {
-                let byte_count = dimensions.div_ceil(2);
-                // SAFETY: The caller guarantees a valid packed B group.
-                let packed = unsafe {
-                    values
-                        .add(Elements::new(byte_offset))
-                        .truncate(Elements::new(byte_count))
-                        .as_std_slice(byte_count)
-                };
-                i8s::from_array(
-                    self,
-                    core::array::from_fn(|i| {
-                        let dimension = i % 8;
-                        if dimension >= dimensions {
-                            0
-                        } else {
-                            let value = packed[dimension / 2];
-                            if dimension.is_multiple_of(2) {
-                                (value & 0x0f) as i8
-                            } else {
-                                (value >> 4) as i8
-                            }
-                        }
-                    }),
-                )
-            }
-
-            #[cfg(not(miri))]
-            {
-                use std::arch::x86_64::_pdep_u64;
-                diskann_wide::alias!(u64s = <V4>::u64x8);
-
-                let byte_count = dimensions.div_ceil(2);
-                // SAFETY: The caller guarantees a valid packed B group.
-                let packed = unsafe {
-                    values
-                        .add(Elements::new(byte_offset))
-                        .truncate(Elements::new(byte_count))
-                };
-                let source = if dimensions == 8 {
-                    // SAFETY: A full group tracks four bytes and the load is unaligned.
-                    u32::from_le(unsafe { packed.as_ptr().cast::<u32>().read_unaligned() })
-                } else {
-                    let mut source = 0_u32;
-                    for index in 0..byte_count {
-                        // SAFETY: `index` is within the tracked packed group.
-                        let value = unsafe { *packed.add(Elements::new(index)).as_unit().as_ref() };
-                        source |= u32::from(value) << (8 * index);
-                    }
-                    source
-                };
-                // SAFETY: V4 provides BMI2; wide has no bit-deposit operation.
-                let expanded = unsafe { _pdep_u64(u64::from(source), 0x0f0f_0f0f_0f0f_0f0f) };
-                i8s::from_underlying(self, u64s::splat(self, expanded).to_underlying())
-            }
+            let byte_count = dimensions.div_ceil(2);
+            // SAFETY: The caller guarantees a valid packed B group.
+            let packed = unsafe {
+                values
+                    .add(Elements::new(byte_offset))
+                    .truncate(Elements::new(byte_count))
+            };
+            let source = if dimensions == 8 {
+                // SAFETY: A full group tracks four bytes and the load is unaligned.
+                u32::from_le(unsafe { packed.as_ptr().cast::<u32>().read_unaligned() })
+            } else {
+                let mut source = 0_u32;
+                for index in 0..byte_count {
+                    // SAFETY: `index` is within the tracked packed group.
+                    let value = unsafe { *packed.add(Elements::new(index)).as_unit().as_ref() };
+                    source |= u32::from(value) << (8 * index);
+                }
+                source
+            };
+            algorithms::splat_u4x8(self, source)
         }
 
         fn dot(self, accumulator: Self::Accumulator, a: Self::A, b: Self::B) -> Self::Accumulator {
@@ -752,32 +676,8 @@ mod x86_64 {
         fn to_float(self, accumulator: Self::Accumulator) -> Self::Float {
             diskann_wide::alias!(f32s = <V4>::f32x8);
 
-            #[cfg(miri)]
-            {
-                let values = accumulator.to_array();
-                f32s::from_array(
-                    self,
-                    core::array::from_fn(|i| {
-                        values[2 * i].wrapping_add(values[2 * i + 1]) as u32 as f32
-                    }),
-                )
-            }
-
-            #[cfg(not(miri))]
-            {
-                use std::arch::x86_64::_mm512_cvtepi64_epi32;
-                diskann_wide::alias!(i32s8 = <V4>::i32x8);
-                diskann_wide::alias!(u64s = <V4>::u64x8);
-
-                let upper = u64s::from_underlying(self, accumulator.to_underlying()) >> 32;
-                let pairs =
-                    accumulator + Self::Accumulator::from_underlying(self, upper.to_underlying());
-                // SAFETY: V4 provides AVX-512F; wide has no u64-to-u32 lane narrowing.
-                let reduced = i32s8::from_underlying(self, unsafe {
-                    _mm512_cvtepi64_epi32(pairs.to_underlying())
-                });
-                f32s::from_array(self, reduced.to_array().map(|x| (x as u32) as f32))
-            }
+            let reduced = algorithms::sum_adjacent_i32x16(accumulator);
+            f32s::from_array(self, reduced.to_array().map(|x| (x as u32) as f32))
         }
     }
 
@@ -789,8 +689,8 @@ mod x86_64 {
 mod aarch64 {
     use super::*;
 
-    use diskann_wide::SIMDVector;
     use diskann_wide::arch::aarch64::Neon;
+    use diskann_wide::{SIMDReinterpret, SIMDVector};
 
     panel_kernel!(Neon, 8, 8, [1, 2, 3, 4, 5, 6, 7]);
 
@@ -802,7 +702,6 @@ mod aarch64 {
         dimensions: usize,
     ) -> <Neon as Architecture>::u8x16 {
         diskann_wide::alias!(u32s = <Neon>::u32x4);
-        diskann_wide::alias!(u8s = <Neon>::u8x16);
 
         let expanded = if dimensions == 4 {
             // SAFETY: Four dimensions occupy two packed bytes.
@@ -811,20 +710,7 @@ mod aarch64 {
             // SAFETY: The caller guarantees a valid final partial group.
             unsafe { expand_tail_u4(values, byte_offset, dimensions) }
         };
-        if cfg!(miri) {
-            let bytes = expanded.to_le_bytes();
-            u8s::from_array(arch, core::array::from_fn(|i| bytes[i % 4]))
-        } else {
-            u8s::from_underlying(
-                arch,
-                // SAFETY: Reinterpreting a vector does not change its bits.
-                unsafe {
-                    std::arch::aarch64::vreinterpretq_u8_u32(
-                        u32s::splat(arch, expanded).to_underlying(),
-                    )
-                },
-            )
-        }
+        u32s::splat(arch, expanded).reinterpret_simd()
     }
 
     #[inline(always)]
