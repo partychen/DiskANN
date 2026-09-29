@@ -592,3 +592,115 @@ impl From<V4> for V3 {
         arch.retarget()
     }
 }
+
+///////////////////////
+// Custom Intrinsics //
+///////////////////////
+
+impl V4 {
+    /// Sum adjacent pairs of i32 lanes with wrapping arithmetic.
+    ///
+    /// Result lane `i` is `x[2 * i].wrapping_add(x[2 * i + 1])`.
+    #[inline(always)]
+    pub fn add_adjacent_i32x16(self, x: i32x16) -> i32x8 {
+        #[cfg(miri)]
+        {
+            let x = x.to_array();
+            i32x8::from_array(
+                self,
+                core::array::from_fn(|i| x[2 * i].wrapping_add(x[2 * i + 1])),
+            )
+        }
+        #[cfg(not(miri))]
+        {
+            use std::arch::x86_64::{_mm512_add_epi32, _mm512_cvtepi64_epi32, _mm512_srli_epi64};
+
+            let x = x.to_underlying();
+            // Align odd lanes with even lanes, add without inter-lane carry, then
+            // extract the low 32 bits of each 64-bit lane.
+            // SAFETY: V4 provides AVX-512F.
+            i32x8::from_underlying(self, unsafe {
+                _mm512_cvtepi64_epi32(_mm512_add_epi32(x, _mm512_srli_epi64::<32>(x)))
+            })
+        }
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils;
+
+    #[test]
+    fn test_add_adjacent_i32x16() {
+        let arch = V4::new_checked_miri();
+        #[cfg(miri)]
+        assert!(arch.is_some(), "Miri must execute the V4 emulated fallback");
+
+        if let Some(arch) = arch {
+            for (x, expected) in [
+                (
+                    [
+                        1, -2, -4, 8, 16, -32, -64, 128, 256, -512, -1024, 2048, 4096, -8192,
+                        -16384, 32768,
+                    ],
+                    [-1, 4, -16, 64, -256, 1024, -4096, 16384],
+                ),
+                (
+                    [
+                        i32::MAX,
+                        1,
+                        i32::MIN,
+                        -1,
+                        i32::MAX,
+                        i32::MAX,
+                        i32::MIN,
+                        i32::MIN,
+                        -1,
+                        -1,
+                        i32::MAX,
+                        i32::MIN,
+                        i32::MAX,
+                        2,
+                        i32::MIN,
+                        -2,
+                    ],
+                    [
+                        i32::MIN,
+                        i32::MAX,
+                        -2,
+                        0,
+                        -2,
+                        -1,
+                        i32::MIN + 1,
+                        i32::MAX - 1,
+                    ],
+                ),
+            ] {
+                let got = arch
+                    .add_adjacent_i32x16(i32x16::from_array(arch, x))
+                    .to_array();
+                assert_eq!(got, expected, "input: {x:?}");
+            }
+
+            let f = move |x: &[i32]| {
+                let got = arch
+                    .add_adjacent_i32x16(i32x16::from_array(arch, x.try_into().unwrap()))
+                    .to_array();
+                for (i, (pair, got)) in x.chunks_exact(2).zip(got).enumerate() {
+                    assert_eq!(
+                        got,
+                        pair[0].wrapping_add(pair[1]),
+                        "input: {x:?}, result lane: {i}"
+                    );
+                }
+            };
+
+            test_utils::driver::drive_unary(&f, 16, 0x8b92b36d4a5071cf);
+        }
+    }
+}
