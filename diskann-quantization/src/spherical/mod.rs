@@ -3,6 +3,7 @@
  * Licensed under the MIT license.
  */
 
+pub(crate) use vectors::compensation;
 pub mod iface;
 pub(crate) mod quantizer;
 mod vectors;

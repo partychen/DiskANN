@@ -2,6 +2,18 @@
 
 Refer to the crate level documentation for usage of the `quantization` crate.
 
+## Spherical tile MaxSim
+
+The internal Spherical tile kernel shares unsigned SIMD dot products and native
+floating-point reduction from the existing MinMax kernel. Each kernel retains its
+own driver; there is no generic reduction engine. It owns the prepared query and decodes
+document tiles on each scoring call. Compensation precedes the maximum; scores
+are per-query-vector negative maxima, with `f32::MAX` for empty/no-match documents.
+
+The kernel uses existing Spherical row references and canonical document bytes.
+Queries, documents, and compensation context must originate from the same
+quantizer. Public multi-vector views and an ISA factory are not introduced yet.
+
 ## Inspecting CPU caches
 
 ```shell

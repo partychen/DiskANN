@@ -14,12 +14,12 @@
 
 use std::{
     num::NonZeroUsize,
-    ops::{Add, Mul},
+    ops::{Add, Mul, Sub},
 };
 
 use diskann_utils::views::rowmajor::{self, Matrix, MatrixMut};
 use diskann_wide::{
-    Const, SIMDCast, SIMDDotProduct, SIMDMinMax, SIMDReinterpret, SIMDVector, SupportedLaneCount,
+    SIMDCast, SIMDDotProduct, SIMDMinMax, SIMDReinterpret, SIMDVector,
     arch::{Architecture, Scalar, Target},
 };
 
@@ -39,6 +39,8 @@ use crate::{
 
 use super::packed_f32_x_unpacked_f32::Params;
 
+diskann_wide::alias!(f32x8<W> = f32x8);
+diskann_wide::alias!(f32x16<W> = f32x16);
 diskann_wide::alias!(i8x32<W> = i8x32);
 diskann_wide::alias!(i8x64<W> = i8x64);
 diskann_wide::alias!(i16x16<W> = i16x16);
@@ -136,19 +138,23 @@ struct AView<'a, T, const MR: usize, const PACK: usize> {
 }
 
 impl<T: Copy, const MR: usize, const PACK: usize> AView<'_, T, MR, PACK> {
-    #[inline]
+    #[inline(always)]
     fn visit_panels(&self, mut visitor: impl FnMut(APanel<'_, T, MR, PACK>, usize)) {
         // SAFETY: PackedA constructs codes and coefficients with the same panel count and K.
         unsafe {
-            self.codes.visit_panels(self.k, |codes, i| {
-                visitor(
-                    APanel {
-                        codes,
-                        meta: &self.meta[i],
-                    },
-                    i,
-                );
-            });
+            self.codes.visit_panels(
+                self.k,
+                #[inline(always)]
+                |codes, i| {
+                    visitor(
+                        APanel {
+                            codes,
+                            meta: &self.meta[i],
+                        },
+                        i,
+                    );
+                },
+            );
         }
     }
 }
@@ -272,41 +278,44 @@ where
     for<'a> PanelKernel<'a, W, MR, NR, PACK>: driver::PanelKernel,
 {
     fn drive(&mut self) {
-        self.arch.run(
-            #[inline(always)]
-            || {
-                self.c.fill(f32::NEG_INFINITY);
-                let mut scratch = BScratch::<W::BElem>::default();
-                let mut start = 0;
-                while let Some(remaining) = NonZeroUsize::new(self.b.nrows() - start) {
-                    let count = remaining.min(self.b_rows_per_tile);
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "count is bounded by the remaining rows"
-                    )]
-                    let source = self
-                        .b
-                        .subview(start..start + count.get())
-                        .expect("B tile in bounds");
-                    let b = scratch.prepare::<PACK>(source, self.a.k, self.decode_tile);
-                    self.a.visit_panels(
-                        #[inline(always)]
-                        |a, panel| {
-                            let row = panel * MR;
-                            let end = (row + MR).min(self.c.len());
-                            let c = self.arch.load(&self.c[row..end]);
-                            // SAFETY: A and B share K by the driver contract.
-                            let kernel =
-                                unsafe { PanelKernel::<W, MR, NR, PACK>::new(self.arch, a, b, c) };
-                            // Already inside the driver's target-feature entry.
-                            let c = kernel.run(self.arch);
-                            self.arch.store(c, &mut self.c[row..end]);
-                        },
-                    );
-                    start += count.get();
-                }
-            },
-        );
+        self.arch.run(self);
+    }
+}
+
+impl<W, const MR: usize, const NR: usize, const PACK: usize> Target<W, ()>
+    for &mut Driver<'_, W, MR, NR, PACK>
+where
+    W: ExtraWide<MR, PACK> + LoadStore<f32, MR>,
+    for<'a> PanelKernel<'a, W, MR, NR, PACK>: driver::PanelKernel,
+{
+    #[inline(always)]
+    fn run(self, _: W) {
+        self.c.fill(f32::NEG_INFINITY);
+        let mut scratch = BScratch::<W::BElem>::default();
+        let mut start = 0;
+        while let Some(remaining) = NonZeroUsize::new(self.b.nrows() - start) {
+            let count = remaining.min(self.b_rows_per_tile);
+            #[expect(clippy::expect_used, reason = "count is bounded by the remaining rows")]
+            let source = self
+                .b
+                .subview(start..start + count.get())
+                .expect("B tile in bounds");
+            let b = scratch.prepare::<PACK>(source, self.a.k, self.decode_tile);
+            self.a.visit_panels(
+                #[inline(always)]
+                |a, panel| {
+                    let row = panel * MR;
+                    let end = (row + MR).min(self.c.len());
+                    let c = self.arch.load(&self.c[row..end]);
+                    // SAFETY: A and B share K by the driver contract.
+                    let kernel = unsafe { PanelKernel::<W, MR, NR, PACK>::new(self.arch, a, b, c) };
+                    // Already inside the driver's target-feature entry.
+                    let c = kernel.run(self.arch);
+                    self.arch.store(c, &mut self.c[row..end]);
+                },
+            );
+            start += count.get();
+        }
     }
 }
 
@@ -570,7 +579,7 @@ unsafe fn accumulate_pack<W, const MR: usize, const NR: usize, const PACK: usize
     bstride: Elements<W::BElem>,
     acc: &mut [W::Acc; NR],
 ) where
-    W: ExtraWide<MR, PACK>,
+    W: UnsignedDot<MR, PACK>,
 {
     // SAFETY: The caller provides a full padded A pack.
     let a = unsafe { arch.load_a(a) };
@@ -588,25 +597,7 @@ impl<W: ExtraWide<MR, PACK>, const MR: usize, const NR: usize, const PACK: usize
     fn micro_kernel(&mut self) {
         let physical_k = self.b.physical_k;
         let k = self.b.k.value().get();
-        let mut acc = [self.arch.zero_acc(); NR];
-        let ap = self.a.codes.as_ptr();
-        let bp = self.b.codes.as_ptr();
-        let astride = self.a.codes.pack_stride();
-        let bstride = self.b.codes.stride(physical_k);
-
-        let packs = physical_k.value().get() / PACK;
-        for pack in 0..packs {
-            // SAFETY: A and every B row are zero-padded to a multiple of PACK.
-            unsafe {
-                accumulate_pack::<W, MR, NR, PACK>(
-                    self.arch,
-                    ap.add(astride * pack),
-                    bp.add(Elements::new(pack * PACK)),
-                    bstride,
-                    &mut acc,
-                );
-            }
-        }
+        let acc = dot_tile::<W, MR, NR, PACK>(self.arch, self.a.codes, self.b.codes, physical_k);
         let a_meta = Coefficients {
             a: &self.a.meta.a,
             b: &self.a.meta.b,
@@ -615,6 +606,40 @@ impl<W: ExtraWide<MR, PACK>, const MR: usize, const NR: usize, const PACK: usize
         self.arch.max_into(acc, a_meta, self.b.meta, k, self.c);
     }
 }
+#[inline(always)]
+pub(in crate::matrix_kernels) fn dot_tile<
+    W: UnsignedDot<MR, PACK>,
+    const MR: usize,
+    const NR: usize,
+    const PACK: usize,
+>(
+    arch: W,
+    a: packed::Panel<'_, W::AElem, MR, PACK>,
+    b: unpacked::Panel<'_, W::BElem, NR>,
+    physical_k: DimK,
+) -> [W::Acc; NR] {
+    let mut acc = [arch.zero_acc(); NR];
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    let astride = a.pack_stride();
+    let bstride = b.stride(physical_k);
+
+    let packs = physical_k.value().get() / PACK;
+    for pack in 0..packs {
+        // SAFETY: A and every B row are zero-padded to a multiple of PACK.
+        unsafe {
+            accumulate_pack::<W, MR, NR, PACK>(
+                arch,
+                ap.add(astride * pack),
+                bp.add(Elements::new(pack * PACK)),
+                bstride,
+                &mut acc,
+            );
+        }
+    }
+    acc
+}
+
 //----------//
 // Backends //
 //----------//
@@ -643,7 +668,7 @@ impl UnpackedCode for u8 {
 }
 
 /// Backends accept A codes in 0..=255; B is limited by `MAX_B_BITS`.
-pub(crate) trait ExtraWide<const MR: usize, const PACK: usize>: Architecture {
+pub(crate) trait UnsignedDot<const MR: usize, const PACK: usize>: Architecture {
     /// Largest unsigned B width valid for every A code.
     const MAX_B_BITS: usize;
 
@@ -663,14 +688,18 @@ pub(crate) trait ExtraWide<const MR: usize, const PACK: usize>: Architecture {
     /// Accumulate MR dot products of PACK elements without mixing rows.
     fn dot(self, acc: Self::Acc, a: Self::Wide, b: Self::Splat) -> Self::Acc;
 
-    /// Compensate with logical K and update maxima, ignoring NaNs.
-    fn max_into<const NR: usize>(
+    type NativeAcc: SIMDCast<f32, Cast = Self::NativeFloat>;
+    type NativeFloat: SIMDVector<Arch = Self, Scalar = f32>
+        + SIMDMinMax
+        + Add<Output = Self::NativeFloat>
+        + Sub<Output = Self::NativeFloat>
+        + Mul<Output = Self::NativeFloat>;
+
+    /// Visit native lane groups without decoding or compensation metadata.
+    fn visit_native<const NR: usize>(
         self,
         acc: [Self::Acc; NR],
-        query: Coefficients<&[f32; MR]>,
-        docs: &[Coefficients<f32>; NR],
-        k: usize,
-        scores: &mut [f32; MR],
+        visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
     );
 
     /// # Safety
@@ -679,40 +708,103 @@ pub(crate) trait ExtraWide<const MR: usize, const PACK: usize>: Architecture {
     unsafe fn splat(self, b: Slice<'_, Self::BElem>) -> Self::Splat;
 }
 
+pub(crate) trait ExtraWide<const MR: usize, const PACK: usize>:
+    UnsignedDot<MR, PACK>
+{
+    #[inline(always)]
+    fn max_into<const NR: usize>(
+        self,
+        acc: [Self::Acc; NR],
+        query: Coefficients<&[f32; MR]>,
+        docs: &[Coefficients<f32>; NR],
+        k: usize,
+        scores: &mut [f32; MR],
+    ) {
+        self.visit_native(
+            acc,
+            #[inline(always)]
+            |start, native| {
+                let end = start + Self::NativeFloat::LANES;
+                compensated_max_into_native::<Self::NativeAcc, Self::NativeFloat, NR>(
+                    self,
+                    native,
+                    Coefficients {
+                        a: &query.a[start..end],
+                        b: &query.b[start..end],
+                        n: &query.n[start..end],
+                    },
+                    docs,
+                    k,
+                    &mut scores[start..end],
+                );
+            },
+        );
+    }
+}
+
+impl<W: UnsignedDot<MR, PACK>, const MR: usize, const PACK: usize> ExtraWide<MR, PACK> for W {}
+
 #[inline(always)]
-fn compensated_max_into<I, F, const MR: usize, const NR: usize>(
+pub(crate) fn load_native<F: SIMDVector<Scalar = f32>>(arch: F::Arch, values: &[f32]) -> F {
+    assert_eq!(values.len(), F::LANES);
+    // SAFETY: The checked slice contains exactly one native lane group.
+    unsafe { F::load_simd(arch, values.as_ptr()) }
+}
+
+#[inline(always)]
+pub(crate) fn reduce_native_max<I, F>(
     arch: F::Arch,
     acc: impl IntoIterator<Item = I>,
-    query: Coefficients<&[f32; MR]>,
-    docs: &[Coefficients<f32>; NR],
-    k: usize,
-    scores: &mut [f32; MR],
+    scores: &mut [f32],
+    mut transform: impl FnMut(F, usize) -> F,
 ) where
     I: SIMDCast<f32, Cast = F>,
-    F: SIMDVector<Scalar = f32, ConstLanes = Const<MR>>
-        + SIMDMinMax
-        + Add<Output = F>
-        + Mul<Output = F>,
-    Const<MR>: SupportedLaneCount,
+    F: SIMDVector<Scalar = f32> + SIMDMinMax,
+{
+    let mut best = load_native::<F>(arch, scores);
+    for (column, acc) in acc.into_iter().enumerate() {
+        best = best.max_simd_standard(transform(acc.simd_cast(), column));
+    }
+    // SAFETY: load_native validated that scores contains one full lane group.
+    unsafe { best.store_simd(scores.as_mut_ptr()) };
+}
+
+#[inline(always)]
+fn compensated_max_into_native<I, F, const NR: usize>(
+    arch: F::Arch,
+    acc: impl IntoIterator<Item = I>,
+    query: Coefficients<&[f32]>,
+    docs: &[Coefficients<f32>; NR],
+    k: usize,
+    scores: &mut [f32],
+) where
+    I: SIMDCast<f32, Cast = F>,
+    F: SIMDVector<Scalar = f32> + SIMDMinMax + Add<Output = F> + Mul<Output = F>,
 {
     let a = Coefficients {
-        a: F::from_array(arch, *query.a),
-        b: F::from_array(arch, *query.b),
-        n: F::from_array(arch, *query.n),
+        a: load_native::<F>(arch, query.a),
+        b: load_native::<F>(arch, query.b),
+        n: load_native::<F>(arch, query.n),
     };
-    let mut best = F::from_array(arch, *scores);
-    for (acc, b) in acc.into_iter().zip(docs) {
-        let dot = acc.simd_cast();
-        let b = Coefficients {
-            a: F::splat(arch, b.a),
-            b: F::splat(arch, b.b),
-            n: F::splat(arch, b.n),
-        };
-        let dim = F::splat(arch, k as f32);
-        let ip = a.compensate_inner_product(b, dot, dim);
-        best = best.max_simd_standard(ip);
-    }
-    *scores = best.to_array();
+    let dim = F::splat(arch, k as f32);
+    reduce_native_max(
+        arch,
+        acc,
+        scores,
+        #[inline(always)]
+        |dot, column| {
+            let b = docs[column];
+            a.compensate_inner_product(
+                Coefficients {
+                    a: F::splat(arch, b.a),
+                    b: F::splat(arch, b.b),
+                    n: F::splat(arch, b.n),
+                },
+                dot,
+                dim,
+            )
+        },
+    );
 }
 
 /// # Safety
@@ -735,7 +827,7 @@ unsafe fn pack_i16_pair(b: Slice<'_, i16>) -> u32 {
     u32::from(lo as u16) | (u32::from(hi as u16) << 16)
 }
 
-impl ExtraWide<16, 4> for Scalar {
+impl UnsignedDot<16, 4> for Scalar {
     const MAX_B_BITS: usize = 7;
 
     type AElem = u8;
@@ -743,6 +835,8 @@ impl ExtraWide<16, 4> for Scalar {
     type Wide = u8x64<Scalar>;
     type Splat = i8x64<Scalar>;
     type Acc = i32x16<Scalar>;
+    type NativeAcc = Self::Acc;
+    type NativeFloat = f32x16<Scalar>;
 
     #[inline(always)]
     unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -756,15 +850,12 @@ impl ExtraWide<16, 4> for Scalar {
     }
 
     #[inline(always)]
-    fn max_into<const NR: usize>(
+    fn visit_native<const NR: usize>(
         self,
         acc: [Self::Acc; NR],
-        query: Coefficients<&[f32; 16]>,
-        docs: &[Coefficients<f32>; NR],
-        k: usize,
-        scores: &mut [f32; 16],
+        mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
     ) {
-        compensated_max_into(self, acc, query, docs, k, scores);
+        visitor(0, acc);
     }
 
     #[inline(always)]
@@ -781,7 +872,7 @@ impl ExtraWide<16, 4> for Scalar {
     }
 }
 
-impl ExtraWide<16, 2> for Scalar {
+impl UnsignedDot<16, 2> for Scalar {
     const MAX_B_BITS: usize = 8;
 
     type AElem = i16;
@@ -789,6 +880,8 @@ impl ExtraWide<16, 2> for Scalar {
     type Wide = i16x32<Scalar>;
     type Splat = Self::Wide;
     type Acc = i32x16<Scalar>;
+    type NativeAcc = Self::Acc;
+    type NativeFloat = f32x16<Scalar>;
 
     #[inline(always)]
     unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -802,15 +895,12 @@ impl ExtraWide<16, 2> for Scalar {
     }
 
     #[inline(always)]
-    fn max_into<const NR: usize>(
+    fn visit_native<const NR: usize>(
         self,
         acc: [Self::Acc; NR],
-        query: Coefficients<&[f32; 16]>,
-        docs: &[Coefficients<f32>; NR],
-        k: usize,
-        scores: &mut [f32; 16],
+        mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
     ) {
-        compensated_max_into(self, acc, query, docs, k, scores);
+        visitor(0, acc);
     }
 
     #[inline(always)]
@@ -825,13 +915,15 @@ impl ExtraWide<16, 2> for Scalar {
     }
 }
 
-impl ExtraWide<8, 2> for Scalar {
+impl UnsignedDot<8, 2> for Scalar {
     const MAX_B_BITS: usize = 8;
     type AElem = i16;
     type BElem = i16;
     type Wide = i16x16<Scalar>;
     type Splat = Self::Wide;
     type Acc = i32x8<Scalar>;
+    type NativeAcc = Self::Acc;
+    type NativeFloat = f32x8<Scalar>;
 
     #[inline(always)]
     unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -845,15 +937,12 @@ impl ExtraWide<8, 2> for Scalar {
     }
 
     #[inline(always)]
-    fn max_into<const NR: usize>(
+    fn visit_native<const NR: usize>(
         self,
         acc: [Self::Acc; NR],
-        query: Coefficients<&[f32; 8]>,
-        docs: &[Coefficients<f32>; NR],
-        k: usize,
-        scores: &mut [f32; 8],
+        mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
     ) {
-        compensated_max_into(self, acc, query, docs, k, scores);
+        visitor(0, acc);
     }
 
     #[inline(always)]
@@ -874,53 +963,15 @@ mod x86_64 {
     use diskann_wide::SplitJoin;
     use diskann_wide::arch::x86_64::{V3, V4};
 
-    #[inline(always)]
-    fn compensated_max_into_v3<const NR: usize>(
-        arch: V3,
-        acc: [i32x16<V3>; NR],
-        query: Coefficients<&[f32; 16]>,
-        docs: &[Coefficients<f32>; NR],
-        k: usize,
-        scores: &mut [f32; 16],
-    ) {
-        let a = query.a.as_chunks::<8>().0;
-        let b = query.b.as_chunks::<8>().0;
-        let n = query.n.as_chunks::<8>().0;
-        let scores = scores.as_chunks_mut::<8>().0;
-        // Finish one native-width row group before loading the next group's coefficients.
-        compensated_max_into(
-            arch,
-            acc.iter().map(|v| v.split().lo),
-            Coefficients {
-                a: &a[0],
-                b: &b[0],
-                n: &n[0],
-            },
-            docs,
-            k,
-            &mut scores[0],
-        );
-        compensated_max_into(
-            arch,
-            acc.iter().map(|v| v.split().hi),
-            Coefficients {
-                a: &a[1],
-                b: &b[1],
-                n: &n[1],
-            },
-            docs,
-            k,
-            &mut scores[1],
-        );
-    }
-
-    impl ExtraWide<8, 4> for V3 {
+    impl UnsignedDot<8, 4> for V3 {
         const MAX_B_BITS: usize = 6;
         type AElem = u8;
         type BElem = i8;
         type Wide = u8x32<V3>;
         type Splat = i8x32<V3>;
         type Acc = i32x8<V3>;
+        type NativeAcc = Self::Acc;
+        type NativeFloat = f32x8<V3>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -934,15 +985,12 @@ mod x86_64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 8]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 8],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into(self, acc, query, docs, k, scores);
+            visitor(0, acc);
         }
 
         #[inline(always)]
@@ -959,13 +1007,15 @@ mod x86_64 {
         }
     }
 
-    impl ExtraWide<8, 2> for V3 {
+    impl UnsignedDot<8, 2> for V3 {
         const MAX_B_BITS: usize = 8;
         type AElem = i16;
         type BElem = i16;
         type Wide = i16x16<V3>;
         type Splat = Self::Wide;
         type Acc = i32x8<V3>;
+        type NativeAcc = Self::Acc;
+        type NativeFloat = f32x8<V3>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -979,15 +1029,12 @@ mod x86_64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 8]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 8],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into(self, acc, query, docs, k, scores);
+            visitor(0, acc);
         }
 
         #[inline(always)]
@@ -1002,7 +1049,7 @@ mod x86_64 {
         }
     }
 
-    impl ExtraWide<16, 4> for V3 {
+    impl UnsignedDot<16, 4> for V3 {
         const MAX_B_BITS: usize = 6;
 
         type AElem = u8;
@@ -1010,6 +1057,8 @@ mod x86_64 {
         type Wide = u8x64<V3>;
         type Splat = i8x64<V3>;
         type Acc = i32x16<V3>;
+        type NativeAcc = i32x8<V3>;
+        type NativeFloat = f32x8<V3>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -1023,15 +1072,13 @@ mod x86_64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 16]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 16],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into_v3(self, acc, query, docs, k, scores);
+            visitor(0, acc.map(|v| v.split().lo));
+            visitor(8, acc.map(|v| v.split().hi));
         }
 
         #[inline(always)]
@@ -1057,7 +1104,7 @@ mod x86_64 {
         }
     }
 
-    impl ExtraWide<16, 2> for V3 {
+    impl UnsignedDot<16, 2> for V3 {
         const MAX_B_BITS: usize = 8;
 
         type AElem = i16;
@@ -1065,6 +1112,8 @@ mod x86_64 {
         type Wide = i16x32<V3>;
         type Splat = Self::Wide;
         type Acc = i32x16<V3>;
+        type NativeAcc = i32x8<V3>;
+        type NativeFloat = f32x8<V3>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -1078,15 +1127,13 @@ mod x86_64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 16]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 16],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into_v3(self, acc, query, docs, k, scores);
+            visitor(0, acc.map(|v| v.split().lo));
+            visitor(8, acc.map(|v| v.split().hi));
         }
 
         #[inline(always)]
@@ -1103,7 +1150,7 @@ mod x86_64 {
         }
     }
 
-    impl ExtraWide<16, 4> for V4 {
+    impl UnsignedDot<16, 4> for V4 {
         const MAX_B_BITS: usize = 7;
 
         type AElem = u8;
@@ -1111,6 +1158,8 @@ mod x86_64 {
         type Wide = u8x64<V4>;
         type Splat = i8x64<V4>;
         type Acc = i32x16<V4>;
+        type NativeAcc = Self::Acc;
+        type NativeFloat = f32x16<V4>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -1124,15 +1173,12 @@ mod x86_64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 16]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 16],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into(self, acc, query, docs, k, scores);
+            visitor(0, acc);
         }
 
         #[inline(always)]
@@ -1149,7 +1195,7 @@ mod x86_64 {
         }
     }
 
-    impl ExtraWide<16, 2> for V4 {
+    impl UnsignedDot<16, 2> for V4 {
         const MAX_B_BITS: usize = 8;
 
         type AElem = i16;
@@ -1157,6 +1203,8 @@ mod x86_64 {
         type Wide = i16x32<V4>;
         type Splat = Self::Wide;
         type Acc = i32x16<V4>;
+        type NativeAcc = Self::Acc;
+        type NativeFloat = f32x16<V4>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -1170,15 +1218,12 @@ mod x86_64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 16]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 16],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into(self, acc, query, docs, k, scores);
+            visitor(0, acc);
         }
 
         #[inline(always)]
@@ -1199,13 +1244,15 @@ mod aarch64 {
     use super::*;
     use diskann_wide::arch::aarch64::Neon;
 
-    impl ExtraWide<8, 4> for Neon {
+    impl UnsignedDot<8, 4> for Neon {
         const MAX_B_BITS: usize = 8;
         type AElem = u8;
         type BElem = u8;
         type Wide = u8x32<Neon>;
         type Splat = Self::Wide;
         type Acc = u32x8<Neon>;
+        type NativeAcc = Self::Acc;
+        type NativeFloat = f32x8<Neon>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -1219,15 +1266,12 @@ mod aarch64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 8]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 8],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into(self, acc, query, docs, k, scores);
+            visitor(0, acc);
         }
 
         #[inline(always)]
@@ -1244,7 +1288,7 @@ mod aarch64 {
         }
     }
 
-    impl ExtraWide<16, 4> for Neon {
+    impl UnsignedDot<16, 4> for Neon {
         const MAX_B_BITS: usize = 8;
 
         type AElem = u8;
@@ -1252,6 +1296,8 @@ mod aarch64 {
         type Wide = u8x64<Neon>;
         type Splat = Self::Wide;
         type Acc = u32x16<Neon>;
+        type NativeAcc = Self::Acc;
+        type NativeFloat = f32x16<Neon>;
 
         #[inline(always)]
         unsafe fn load_a(self, a: Slice<'_, Self::AElem>) -> Self::Wide {
@@ -1265,15 +1311,12 @@ mod aarch64 {
         }
 
         #[inline(always)]
-        fn max_into<const NR: usize>(
+        fn visit_native<const NR: usize>(
             self,
             acc: [Self::Acc; NR],
-            query: Coefficients<&[f32; 16]>,
-            docs: &[Coefficients<f32>; NR],
-            k: usize,
-            scores: &mut [f32; 16],
+            mut visitor: impl FnMut(usize, [Self::NativeAcc; NR]),
         ) {
-            compensated_max_into(self, acc, query, docs, k, scores);
+            visitor(0, acc);
         }
 
         #[inline(always)]
@@ -2094,7 +2137,18 @@ mod tests {
                         }
                     });
                     let mut expected = initial;
-                    compensated_max_into(arch, acc, query, &docs, 31, &mut expected);
+                    compensated_max_into_native(
+                        arch,
+                        acc,
+                        Coefficients {
+                            a: query.a,
+                            b: query.b,
+                            n: query.n,
+                        },
+                        &docs,
+                        31,
+                        &mut expected,
+                    );
                     let mut pair = initial;
                     let mut quad = initial;
                     <V3 as ExtraWide<16, 2>>::max_into(arch, acc, query, &docs, 31, &mut pair);

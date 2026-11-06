@@ -10,6 +10,8 @@
 
 use diskann_wide::arch::x86_64::{V3, V4};
 
+pub use crate::matrix_kernels::maxsim::packed_spherical_x_unpacked_spherical::codegen_v4 as fourbit_v4_ip_maxsim;
+
 use crate::{
     alloc::{AllocatorError, GlobalAllocator},
     bits::{BitTranspose, Dense},

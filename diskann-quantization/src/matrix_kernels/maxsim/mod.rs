@@ -20,6 +20,14 @@ pub(crate) mod packed_f32_x_unpacked_f16;
 pub(crate) mod packed_f32_x_unpacked_f32;
 pub(crate) mod packed_i8_x_unpacked_i8;
 pub(crate) mod packed_minmax_x_unpacked_minmax;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Spherical factory integration is intentionally deferred"
+    )
+)]
+pub(crate) mod packed_spherical_x_unpacked_spherical;
 
 #[cfg(test)]
 mod test;

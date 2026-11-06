@@ -309,7 +309,7 @@ impl DataMeta {
     ///      2
     /// ```
     /// and ensures equal coverage above and below 0.
-    const fn offset_term<const NBITS: usize>() -> f32 {
+    pub(crate) const fn offset_term<const NBITS: usize>() -> f32 {
         ((2usize).pow(NBITS as u32) as f32 - 1.0) / 2.0
     }
 
@@ -686,8 +686,8 @@ where
 /// distance function over `CompensatedVectors` belonging to the same quantization space.
 #[derive(Debug, Clone, Copy)]
 pub struct CompensatedIP {
-    pub(super) squared_shift_norm: f32,
-    pub(super) dim: f32,
+    pub(crate) squared_shift_norm: f32,
+    pub(crate) dim: f32,
 }
 
 impl CompensatedIP {
@@ -750,10 +750,18 @@ where
         let xc = x.meta().to_full(arch);
         let yc = y.meta().to_full(arch);
 
-        let result = xc.metric_specific
-            + yc.metric_specific
-            + kernel(arch, x, y, self.dim)?
-            + self.squared_shift_norm;
+        let ip: distances::MathematicalResult<u32> =
+            <_ as Target2<_, _, _, _>>::run(InnerProduct, arch, x.vector(), y.vector());
+        let ip = ip?.into_inner() as f32;
+        let result = super::compensation::symmetric(
+            ip,
+            xc.into(),
+            yc.into(),
+            ConstOffset::<NBITS>::OFFSET,
+            ConstOffset::<NBITS>::OFFSET_SQUARED,
+            self.dim,
+            self.squared_shift_norm,
+        );
         Ok(MV::new(result))
     }
 }
@@ -789,15 +797,14 @@ where
         // Rely on constant propagation to pre-compute these terms.
         let y_offset: f32 = DataMeta::offset_term::<D>();
 
-        let corrected_ip = xc.inner_product_correction
-            * yc.inner_product_correction
-            * (ip.into_inner() as f32 - y_offset * xc.bit_sum + xc.offset * yc.bit_sum
-                - y_offset * xc.offset * self.dim);
-
-        // Finally, reassemble the remaining compensation terms.
-        Ok(MV::new(
-            corrected_ip + yc.metric_specific + xc.metric_specific + self.squared_shift_norm,
-        ))
+        Ok(MV::new(super::compensation::mixed(
+            ip.into_inner() as f32,
+            xc.into(),
+            yc.into(),
+            y_offset,
+            self.dim,
+            self.squared_shift_norm,
+        )))
     }
 }
 
@@ -1842,6 +1849,235 @@ mod tests {
                 Approx::new(2.0e-3, 1.0e-4),
                 &mut rng,
             );
+        }
+    }
+}
+
+pub(crate) mod compensation {
+    use std::ops::{Add, Mul, Sub};
+
+    use super::{DataMetaF32, QueryMeta};
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct DataTerms<T> {
+        pub correction: T,
+        pub metric_specific: T,
+        pub bit_sum: T,
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct QueryTerms<T> {
+        pub correction: T,
+        pub metric_specific: T,
+        pub bit_sum: T,
+        pub offset: T,
+    }
+
+    impl From<DataMetaF32> for DataTerms<f32> {
+        fn from(meta: DataMetaF32) -> Self {
+            Self {
+                correction: meta.inner_product_correction,
+                metric_specific: meta.metric_specific,
+                bit_sum: meta.bit_sum,
+            }
+        }
+    }
+
+    impl From<QueryMeta> for QueryTerms<f32> {
+        fn from(meta: QueryMeta) -> Self {
+            Self {
+                correction: meta.inner_product_correction,
+                metric_specific: meta.metric_specific,
+                bit_sum: meta.bit_sum,
+                offset: meta.offset,
+            }
+        }
+    }
+
+    /// Preserve the pairwise symmetric operation order, including metric-term addition.
+    #[inline(always)]
+    pub(crate) fn symmetric<T>(
+        dot: T,
+        query: DataTerms<T>,
+        document: DataTerms<T>,
+        offset: T,
+        offset_squared: T,
+        dim: T,
+        squared_shift_norm: T,
+    ) -> T
+    where
+        T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
+    {
+        let core = query.correction
+            * document.correction
+            * (dot - offset * (query.bit_sum + document.bit_sum) + offset_squared * dim);
+        query.metric_specific + document.metric_specific + core + squared_shift_norm
+    }
+
+    /// Preserve the mixed query/document signs and its distinct metric-term addition order.
+    #[inline(always)]
+    pub(crate) fn mixed<T>(
+        dot: T,
+        query: QueryTerms<T>,
+        document: DataTerms<T>,
+        document_offset: T,
+        dim: T,
+        squared_shift_norm: T,
+    ) -> T
+    where
+        T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
+    {
+        let core = query.correction
+            * document.correction
+            * (dot - document_offset * query.bit_sum + query.offset * document.bit_sum
+                - document_offset * query.offset * dim);
+        core + document.metric_specific + query.metric_specific + squared_shift_norm
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use diskann_wide::{SIMDVector, arch::Scalar};
+
+        use super::*;
+
+        diskann_wide::alias!(f32x8<A> = f32x8);
+
+        #[test]
+        fn fixed_formulas_scalar_and_simd() {
+            // Cancellation in the last two cases distinguishes the symmetric and mixed
+            // addition orders. The first two exercise nonzero offsets and signed correction.
+            let dots = [29.0, 101.0, 1.0, 1.0, 29.0, 101.0, 1.0, 1.0];
+            let query_corrections = [1.25, -0.75, 1.0, 1.0, 1.25, -0.75, 1.0, 1.0];
+            let document_corrections = [0.5, 2.0, 1.0, 1.0, 0.5, 2.0, 1.0, 1.0];
+            let query_metrics = [
+                3.0,
+                -7.0,
+                16777216.0,
+                -16777216.0,
+                3.0,
+                -7.0,
+                16777216.0,
+                -16777216.0,
+            ];
+            let document_metrics = [
+                -2.0,
+                11.0,
+                -16777216.0,
+                16777216.0,
+                -2.0,
+                11.0,
+                -16777216.0,
+                16777216.0,
+            ];
+            let query_sums = [9.0, 17.0, 0.0, 0.0, 9.0, 17.0, 0.0, 0.0];
+            let document_sums = [7.0, 31.0, 0.0, 0.0, 7.0, 31.0, 0.0, 0.0];
+            let query_offsets = [-0.375, 1.125, 0.0, 0.0, -0.375, 1.125, 0.0, 0.0];
+            let offsets = [0.5, 3.5, 0.0, 0.0, 0.5, 3.5, 0.0, 0.0];
+            let offset_squares = [0.25, 12.25, 0.0, 0.0, 0.25, 12.25, 0.0, 0.0];
+            let dims = [13.0, 23.0, 0.0, 0.0, 13.0, 23.0, 0.0, 0.0];
+            let shifts = [4.0, 0.125, 0.25, 0.25, 4.0, 0.125, 0.25, 0.25];
+
+            let symmetric_expected: [f32; 4] = [
+                3.0 + -2.0 + 1.25 * 0.5 * (29.0 - 0.5 * (9.0 + 7.0) + 0.25 * 13.0) + 4.0,
+                -7.0 + 11.0 + -0.75 * 2.0 * (101.0 - 3.5 * (17.0 + 31.0) + 12.25 * 23.0) + 0.125,
+                1.25,
+                1.25,
+            ];
+            let mixed_expected: [f32; 4] = [
+                1.25 * 0.5 * (29.0 - 0.5 * 9.0 + -0.375 * 7.0 - 0.5 * -0.375 * 13.0)
+                    + -2.0
+                    + 3.0
+                    + 4.0,
+                -0.75 * 2.0 * (101.0 - 3.5 * 17.0 + 1.125 * 31.0 - 3.5 * 1.125 * 23.0)
+                    + 11.0
+                    + -7.0
+                    + 0.125,
+                1.25,
+                0.25,
+            ];
+
+            for i in 0..8 {
+                let query = DataTerms {
+                    correction: query_corrections[i],
+                    metric_specific: query_metrics[i],
+                    bit_sum: query_sums[i],
+                };
+                let document = DataTerms {
+                    correction: document_corrections[i],
+                    metric_specific: document_metrics[i],
+                    bit_sum: document_sums[i],
+                };
+                let symmetric_result: f32 = symmetric(
+                    dots[i],
+                    query,
+                    document,
+                    offsets[i],
+                    offset_squares[i],
+                    dims[i],
+                    shifts[i],
+                );
+                let mixed_result: f32 = mixed(
+                    dots[i],
+                    QueryTerms {
+                        correction: query.correction,
+                        metric_specific: query.metric_specific,
+                        bit_sum: query.bit_sum,
+                        offset: query_offsets[i],
+                    },
+                    document,
+                    offsets[i],
+                    dims[i],
+                    shifts[i],
+                );
+                assert_eq!(
+                    symmetric_result.to_bits(),
+                    symmetric_expected[i % 4].to_bits()
+                );
+                assert_eq!(mixed_result.to_bits(), mixed_expected[i % 4].to_bits());
+            }
+
+            let wide = |values| f32x8::<Scalar>::from_array(Scalar, values);
+            let query = DataTerms {
+                correction: wide(query_corrections),
+                metric_specific: wide(query_metrics),
+                bit_sum: wide(query_sums),
+            };
+            let document = DataTerms {
+                correction: wide(document_corrections),
+                metric_specific: wide(document_metrics),
+                bit_sum: wide(document_sums),
+            };
+            let symmetric_result = symmetric(
+                wide(dots),
+                query,
+                document,
+                wide(offsets),
+                wide(offset_squares),
+                wide(dims),
+                wide(shifts),
+            )
+            .to_array();
+            let mixed_result = mixed(
+                wide(dots),
+                QueryTerms {
+                    correction: query.correction,
+                    metric_specific: query.metric_specific,
+                    bit_sum: query.bit_sum,
+                    offset: wide(query_offsets),
+                },
+                document,
+                wide(offsets),
+                wide(dims),
+                wide(shifts),
+            )
+            .to_array();
+            for i in 0..8 {
+                assert_eq!(
+                    symmetric_result[i].to_bits(),
+                    symmetric_expected[i % 4].to_bits()
+                );
+                assert_eq!(mixed_result[i].to_bits(), mixed_expected[i % 4].to_bits());
+            }
         }
     }
 }
